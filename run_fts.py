@@ -23,13 +23,13 @@ def parse_args():
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--dataset", type=str, default="synthetic_4x4")
     parser.add_argument("--traffic_file", type=str, default="anon_4_4_synthetic_8000.json")
-    parser.add_argument("--mode", type=str, default="fts2", help="fts/fts2")
+    parser.add_argument("--mode", type=str, default="fts", help="fts")
     parser.add_argument("--reward_type", type=str, default="avg_ql", help="near_ql/near_wt/near_tt/avg_ql/avg_wt/avg_tt/far_ql/far_wt/far_tt/qlwt/early_ocp/far_ocp/avg_ocp")
     parser.add_argument("--long_info", type=bool, default=True)
     parser.add_argument("--feed_back", type=bool, default=True)
     parser.add_argument("--feed_back_num", type=int, default=1)
     parser.add_argument("--debug_wollm", type=bool, default=False)
-    parser.add_argument("--reward_period", type=int, default=1)
+    parser.add_argument("--reward_period", type=int, default=5)
     parser.add_argument("--ignore_threshold", type=float, default=0.5)
     return parser.parse_args()
 
@@ -163,12 +163,6 @@ def main(in_args):
                                 merge(dic_traffic_env_conf, dic_traffic_env_conf_extra),
                                 dic_path_extra,
                                 f'{template}-{road_net}', in_args.traffic_file.split(".")[0], my_config)
-    elif in_args.mode == "fts2":
-        trainer = FTS_v2(dic_agent_conf_extra,
-                                merge(dic_traffic_env_conf, dic_traffic_env_conf_extra),
-                                dic_path_extra,
-                                f'{template}-{road_net}', in_args.traffic_file.split(".")[0], my_config)
-
     trainer.train_test()
 
 if __name__ == "__main__":

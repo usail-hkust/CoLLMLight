@@ -30,3 +30,43 @@ Then, run the CoLLMLight with open
 ```shell
 python run_CoLLMlight.py --model_path=YOUR_LLM_PATH --dataset='newyork_28x7' --traffic_file='anon_28_7_newyork_real_double.json'
 ```
+
+<a id="Training"></a>
+## 4 CoLLMLight Training
+
+### Step 1: Simulation Data Sampling
+First, sample the simulation data from the CityFlow environment. Run the following command:
+```shell
+python run_fts.py
+```
+The sampled data will be saved in `./data/FinetuneData/SynTrain_sample.json`.
+
+### Step 2: Reasoning Chain Optimization
+You need to set your API key in `./utils/LLMs.py` first.
+Then, use GPT-4o and the simulation data to generate the synthetic reasoning chain. Execute the command below:
+```shell
+python reasoning_tuning_data_synth.py
+```
+The generated synthetic reasoning chain will be saved in `./data/FinetuneData/syntrain_reasoning_tuning.json`, which you can use to finetune your LLM.
+
+### Step 3: Refinement
+After that, use the finetuned LLM to interact with the simulation data and obtain the refined finetune data. Run the following command, replacing `YOUR_LLM_PATH` with the actual path of your LLM:
+```shell
+lmdeploy serve api_server YOUR_LLM_PATH --tp=YOUR_GPU_NUM
+```
+```shell
+python reasoning_refinement.py --model_path=YOUR_LLM_PATH
+``` 
+
+## Citation
+```bibtex
+@misc{yuan2025collmlightcooperativelargelanguage,
+      title={CoLLMLight: Cooperative Large Language Model Agents for Network-Wide Traffic Signal Control}, 
+      author={Zirui Yuan and Siqi Lai and Hao Liu},
+      year={2025},
+      eprint={2503.11739},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2503.11739}, 
+}
+```

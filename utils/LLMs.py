@@ -7,6 +7,7 @@ import time
 class GPT_model:
     def __init__(self, llm_params = {}, model = "gpt-3.5-turbo", key = None) -> None:
         self.url = None ## you need to prepare your api key
+        self.key = key
         if self.url is None or key is None:
             raise ValueError("Please provide a valid API key and URL.")
         self.headers = {
@@ -24,6 +25,7 @@ class GPT_model:
         self.max_retries = 5
 
     def ask(self, user_prompt, system_prompt = 'You are a helpful AI assistant.'):
+        
         data = {
             "messages": [{"role": "system", "content": system_prompt},
                          {"role": "user", "content": user_prompt}]}

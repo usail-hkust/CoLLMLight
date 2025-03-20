@@ -49,16 +49,7 @@ def extract_json(response):
 
 
 def convert_dict_to_numbered_text(input_dict):  
-    """  
-    将字典转换为带序号的文本段落，关键词加粗并换行  
-    
-    参数:  
-    input_dict (dict): 输入的字典  
-    
-    返回:  
-    str: 带序号的文本段落  
-    """  
-    # 使用enumerate生成带序号的文本行  
+
     numbered_lines = [  
         f"{index + 1}. **{key}**:\n{value}\n"   
         for index, (key, value) in enumerate(input_dict.items())  
