@@ -10,7 +10,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_type", type=str, default="llama") 
     parser.add_argument("--memo", type=str, default='llama3.18b')
-    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--port", type=int, default=23333)
     parser.add_argument("--model_path", type=str, default="YourModelPath"), # add your LLM model path
     parser.add_argument("--num_rounds", type=int, default=1)
     parser.add_argument("--new_max_tokens", type=int, default=8192)

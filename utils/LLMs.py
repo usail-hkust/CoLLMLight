@@ -68,7 +68,7 @@ class GPT_model:
             
 
 class LLAMA_model:
-    def __init__(self, model, llm_params = {}, port = 8080) -> None:
+    def __init__(self, model, llm_params = {}, port = 23333) -> None:
         self.url = "http://localhost:{}/v1/completions".format(port)
         self.headers = {
             "Content-Type": "application/json",

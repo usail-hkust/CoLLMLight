@@ -3,7 +3,7 @@
 <a id="Introduction"></a>
 ## 1 Introduction
 
-Official code for article "CoLLMLight: Cooperative Large Language Model Agents for Network-Wide Traffic Signal Control".
+Official code for article "[CoLLMLight: Cooperative Large Language Model Agents for Network-Wide Traffic Signal Control](https://arxiv.org/abs/2503.11739)".
 
 Traffic Signal Control (TSC) plays a critical role in urban traffic management by optimizing traffic flow and mitigating congestion. While Large Language Models (LLMs) have recently emerged as promising tools for TSC due to their exceptional problem-solving and generalization capabilities, existing approaches fail to address the essential need for inter-agent coordination, limiting their effectiveness in achieving network-wide optimization. To bridge this gap, we propose CoLLMLight, a cooperative LLM agent framework for TSC. 
 Specifically, we first construct a structured spatiotemporal graph to capture real-time traffic dynamics and spatial relationships among neighboring intersections, enabling the LLM to reason about complex traffic interactions.
