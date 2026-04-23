@@ -9,9 +9,9 @@ from utils.utils import merge
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_type", type=str, default="llama") 
-    parser.add_argument("--memo", type=str, default='llama3.18b')
+    parser.add_argument("--memo", type=str, default='collmlight')
     parser.add_argument("--port", type=int, default=23333)
-    parser.add_argument("--model_path", type=str, default="YourModelPath"), # add your LLM model path
+    parser.add_argument("--model_path", type=str, default="your_LLM_path"), # add your LLM model path
     parser.add_argument("--num_rounds", type=int, default=1)
     parser.add_argument("--new_max_tokens", type=int, default=8192)
     parser.add_argument("--proj_name", type=str, default="LLM-TSCS")
@@ -20,14 +20,10 @@ def parse_args():
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--dataset", type=str, default="newyork_28x7")
     parser.add_argument("--traffic_file", type=str, default="anon_28_7_newyork_real_double.json")
-    parser.add_argument("--think_mode", type=str, default="adaptive", help="adaptive/quick/mild/slow/qm/qs/ms")
-    parser.add_argument("--communication_threshold", type=float, default=0.5, help="[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0]")
+    parser.add_argument("--communication_threshold", type=float, default=0, help="0-1, communicate when lane occupancy larger than the threshold")
     parser.add_argument("--h_w_size", type=int, default=5, help="[0,2,5,10,15,30,50]")
-    
+    parser.add_argument("--disable_psr", action="store_true", help="Disable PSR")  ## Herein, PSR refers to spatio-temporal aware cooperative reasoning.
     parser.add_argument("--mode", type=str, default="collmlight", help="collmlight")
-    parser.add_argument("--long_info", type=bool, default=True)
-    parser.add_argument("--feed_back", type=bool, default=True)
-    parser.add_argument("--feed_back_num", type=int, default=1)
     parser.add_argument("--debug_wollm", type=bool, default=False)
     
     return parser.parse_args()
@@ -63,10 +59,8 @@ def main(in_args):
     elif in_args.dataset == 'synthetic_4x4':
         count = 3600
         road_net = "4_4"
-        traffic_file_list = ["anon_4_4_synthetic.json", "anon_4_4_synthetic_8000.json"]
+        traffic_file_list = ["anon_4_4_synthetic_8000.json"]
         template = "Synthetic"
-    if "24h" in in_args.traffic_file:
-        count = 86400
 
     in_args.model = in_args.memo
 
@@ -118,19 +112,13 @@ def main(in_args):
         'llm_path': in_args.model_path,
         'llm_type': in_args.model_type,
         'memo': in_args.memo,
-        'dataset': in_args.traffic_file.strip('.json'),
-        'accumulate_patience': 5,
-        'congestion_scale_ratio': 0.5, # hyper_param
-        'boundary_distance_threshold': 4,
-        'long_info': in_args.long_info,
-        'feed_back': in_args.feed_back,
-        'feed_back_num': in_args.feed_back_num,
+        'dataset': in_args.traffic_file.strip('.json'), 
         'debug_wollm': in_args.debug_wollm,
         'port': in_args.port,
         'max_tokens': in_args.new_max_tokens,
-        'think_mode': in_args.think_mode,
         'communication_threshold': in_args.communication_threshold,
         'h_w_size': in_args.h_w_size,
+        'disable_psr': in_args.disable_psr,
     }
 
     if in_args.eightphase:
@@ -144,6 +132,7 @@ def main(in_args):
             7: [0, 0, 0, 0, 0, 0, 1, 1],
             8: [0, 0, 0, 0, 1, 1, 0, 0]
         }
+
         dic_traffic_env_conf_extra["PHASE_LIST"] = ['WT_ET', 'NT_ST', 'WL_EL', 'NL_SL',
                                                     'WL_WT', 'EL_ET', 'SL_ST', 'NL_NT']
         dic_agent_conf_extra["FIXED_TIME"] = [30, 30, 30, 30, 30, 30, 30, 30]

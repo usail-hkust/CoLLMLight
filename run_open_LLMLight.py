@@ -16,15 +16,15 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--memo", type=str, default='lightgpt')
     parser.add_argument("--llm_model", type=str, default="lightgpt_llama3.1_8b_TSCS_synthetic")
-    parser.add_argument("--llm_path", type=str, default=None)
+    parser.add_argument("--llm_path", type=str, default="light_gpt_path")
     parser.add_argument("--num_rounds", type=int, default=1)
     parser.add_argument("--new_max_tokens", type=int, default=2048)
     parser.add_argument("--proj_name", type=str, default="lightgpt")
     parser.add_argument("--eightphase", action="store_true", default=False)
     parser.add_argument("--multi_process", action="store_true", default=True)
     parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument("--dataset", type=str, default="jinan")
-    parser.add_argument("--traffic_file", type=str, default="anon_3_4_jinan_real.json")
+    parser.add_argument("--dataset", type=str, default="newyork_28x7")
+    parser.add_argument("--traffic_file", type=str, default="anon_28_7_newyork_real_double.json")
     parser.add_argument("--mode", type=str, default="Normal", help="Normal/NC")
     # Normal
     # NC: Neighbor Communication
@@ -61,6 +61,11 @@ def main(in_args):
         road_net = "4_4"
         traffic_file_list = ["anon_4_4_synthetic.json", "anon_4_4_synthetic_8000.json"]
         template = "Synthetic"
+    elif in_args.dataset == 'shenzhen':
+        count = 10000
+        road_net = "1_33"
+        traffic_file_list = ["anon_1_33_fuhua_24hto1w_2490.json", "anon_1_33_fuhua_4_27_24hto1w_4089.json"]
+        template = "Shenzhen"
     in_args.model = in_args.memo
 
     # flow_file error

@@ -280,10 +280,7 @@ class FTS:
             self.history_states.append(deepcopy(current_states))
             # update states
             for i, state in enumerate(current_states):
-                if step_num > 0:
-                    self.agent_intersection_list[i].update_state(state, last_action_list[i], update_memory = True)
-                else:
-                    self.agent_intersection_list[i].update_state(state, None, update_memory = False)
+                self.agent_intersection_list[i].update_state(state, last_action_list[i])
                 # up_down_stream_relation = self.get_up_down_stream_relation(i)
                 # up_down_stream_view = self.get_up_down_stream_view(i, up_down_stream_relation)
                 veh_release_share[i] = self.agent_intersection_list[i].veh_release_data
@@ -307,8 +304,11 @@ class FTS:
 
             prompt_agent_id_list = []
             for i, inter_agent in enumerate(self.agent_intersection_list):
-                if inter_agent.up_down_stream_view['exist']:
-                    prompt_agent_id_list.append(i)
+                prompt_agent_id_list.append(i)
+
+                # if sample only neighbor exist 
+                # if inter_agent.up_down_stream_view['exist']:
+                #     prompt_agent_id_list.append(i)
 
             ## select_signal
             action_list = []
@@ -369,7 +369,7 @@ class FTS:
                 action_list[inter_id] = best_action_id
                 # print(self.signal_list[0])
                 self.FT_data.append(new_data)
-            with open('./data/FinetuneData/SynTrain_sample.json', 'w') as f:
+            with open('./data/FinetuneData/SynTrain_sample_all.json', 'w') as f:
                 json.dump(self.FT_data, f, indent=4)
                 # self.sample_ft_data(inter_id, inter_rewards_dict)
 
@@ -556,7 +556,7 @@ class FTS:
 
     def get_traffic_state_history(self, inter_id):
         traffic_state_log = self.agent_intersection_list[inter_id].traffic_state_log
-        traffic_state_log = traffic_state_log[-5:]
+        traffic_state_log = traffic_state_log[-6:]
         return traffic_state_log
     
     def get_signal_consequence(self, inter_id, next_states, up_down_stream_interlanes):

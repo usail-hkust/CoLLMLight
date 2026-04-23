@@ -702,7 +702,7 @@ class LLM_Inference:
         #     "eos_token_id": terminators
         # }
         self.sampling_params = SamplingParams(temperature=0.1, top_p=0.95, top_k=50, stop_token_ids = [128001, 128009], max_tokens= self.dic_agent_conf["NEW_MAX_TOKENS"])
-        self.llm_model = LLM(model=llm_path,trust_remote_code=True,gpu_memory_utilization=0.8, tensor_parallel_size=1) 
+        self.llm_model = LLM(model=llm_path,trust_remote_code=True,gpu_memory_utilization=0.8, tensor_parallel_size=2) 
 
         
 
@@ -734,7 +734,7 @@ class LLM_Inference:
 
         start_time = time.time()
         state_action_log = [[] for _ in range(len(state))]
-
+        prompt_save_list = []
         # self.llm_model.eval()
         for step_num in tqdm(range(int(total_run_cnt / self.dic_traffic_env_conf['MIN_ACTION_TIME']))):
             if done or current_time >= total_run_cnt:
@@ -774,6 +774,7 @@ class LLM_Inference:
 
             #vLLM
             responses = []
+            prompt_save_list += prompts
             outputs = self.llm_model.generate(prompts, self.sampling_params)
             for output in outputs:
                 # prompt = output.prompt
@@ -858,7 +859,7 @@ class LLM_Inference:
         f_state_action = os.path.join(self.dic_path["PATH_TO_WORK_DIRECTORY"], "state_action.json")
         dump_json(state_action_log, f_state_action)
         print("Testing time: ", time.time() - start_time)
-
+        dump_json(prompt_save_list, "delay_test_lightgpt.json")
         self.env.batch_log_2()
 
         return results

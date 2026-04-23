@@ -8,6 +8,7 @@ import datetime
 import numpy as np
 from utils.cityflow_env import CityFlowEnv
 import utils.config as config
+from utils.prompts import SYSTEM_PROMPT
 
 from tqdm import tqdm
 from copy import deepcopy
@@ -50,7 +51,6 @@ class CoLLMLight:
         self.trafficflow = trafficflow
         self.my_config = my_config
         self.memo = my_config['memo']
-        self.boundary_distance_threshold = self.my_config['boundary_distance_threshold']
         self.history_data = None
         
         self.signal_time = 30
@@ -66,15 +66,10 @@ class CoLLMLight:
         self.car_spacing = 9 
         self.state_action_log = {}
         self.signal_list = list(four_phase_list.keys())
-        self.long_info = my_config['long_info']
-        self.feed_back = my_config['feed_back']
-        self.feed_back_num = my_config['feed_back_num']
         self.debug_wollm = my_config['debug_wollm']
+        self.disable_psr = my_config['disable_psr']
         self.future_inference_depth = 1
         self.history_states = []
-        self.max_thinking_level = "slow" # fast, medium, slow
-        self.only_slow = False
-        self.think_mode = my_config['think_mode']
         self.initialize()
         
     def initialize(self):
@@ -90,7 +85,7 @@ class CoLLMLight:
         self.env.reset()
         self.intersection_list = list(self.env.intersection_dict.keys())
         self.history_data_init()
-        self.boundary_intersections = self.init_boundary_intersections()
+        # self.boundary_intersections = self.init_boundary_intersections()
         self.llm_init()
         self.agent_init()
         self.release_data = []
@@ -104,20 +99,13 @@ class CoLLMLight:
         traffic_env_conf['signal_list'] = list(four_phase_list.keys())
         traffic_env_conf['lane_list'] = location_all_direction_dict #T and L , R
         traffic_env_conf['signal_time'] = self.signal_time
-        traffic_env_conf['accumulate_patience'] = self.my_config['accumulate_patience'] ##queue 持续积累多少次就视为拥堵
-        traffic_env_conf['congestion_scale_ratio'] = self.my_config['congestion_scale_ratio'] ## queue降低为原来的多少视为拥堵解除
-        traffic_env_conf['boundary_distance_threshold'] = self.my_config['boundary_distance_threshold']
         traffic_env_conf['intersection_list'] = self.intersection_list
         self.agent_intersection_list = []
         for i, inter_name in enumerate(self.intersection_list):
             agent_conf = {}
-            agent_conf['think_mode'] = self.think_mode
             agent_conf['inter_name'] = inter_name
             agent_conf['inter_id'] = i
-            agent_conf['boundary'] = True if i in self.boundary_intersections['id_list'] else False
-            agent_conf['long_info'] = self.long_info
-            agent_conf['feed_back'] = self.feed_back
-            agent_conf['feed_back_num'] = self.feed_back_num
+            # agent_conf['boundary'] = True if i in self.boundary_intersections['id_list'] else False
             agent_conf['h_w_size'] = self.h_w_size
             agent = IntersectionAgent(agent_conf, traffic_env_conf, self.LLM)
             agent.neighbor_list = self.get_neighbor_list(i)
@@ -230,11 +218,9 @@ class CoLLMLight:
     def test(self, logger, test_round):
         print("================ Start Test ================")
         total_run_cnt = self.dic_traffic_env_conf["RUN_COUNTS"]
-        total_inference_time = 0
+        total_atr_time = 0
+        total_ra_time = 0
         total_inference_ct = 0
-        n_ct = 0
-        s_ct = 0
-        c_ct = 0
         self.llm_fail_ct = 0
         # initialize output streams
         done = False
@@ -252,12 +238,7 @@ class CoLLMLight:
         last_veh_num = 0
         last_action_list = [None]*len(self.current_states)
         self.veh_last_release_mark = {}
-        no_coordination_history = []  
-        simple_coordination_history = []  
-        complex_coordination_history = []  
         avg_infer_speed = []
-
-
         for step_num in tqdm(range(int(total_run_cnt / self.dic_traffic_env_conf['MIN_ACTION_TIME']))):
             total_step_num = int(total_run_cnt / self.dic_traffic_env_conf['MIN_ACTION_TIME'])
             if done or current_time >= total_run_cnt:
@@ -267,11 +248,7 @@ class CoLLMLight:
             veh_input_share = {}
             self.history_states.append(deepcopy(current_states))
             for i, state in enumerate(current_states):
-                if step_num > 0:
-                    self.agent_intersection_list[i].update_state(state, last_action_list[i], update_memory = True)
-                else:
-                    self.agent_intersection_list[i].update_state(state, None, update_memory = False)
-                # up_down_stream_relation = self.get_up_down_stream_relation(i)
+                self.agent_intersection_list[i].update_state(state, last_action_list[i])
                 # up_down_stream_view = self.get_up_down_stream_view(i, up_down_stream_relation)
                 veh_release_share[i] = self.agent_intersection_list[i].veh_release_data
                 veh_input_share[i] = self.agent_intersection_list[i].veh_input_data
@@ -288,21 +265,11 @@ class CoLLMLight:
                 if step_num > 0:
                     traffic_state_updown_stream = self.get_up_down_stream_traffic_state(i)
                     self.agent_intersection_list[i].update_traffic_state_updown_stream(traffic_state_updown_stream)
-            # get up_down_long_information
-
-            if self.long_info:
-                self.summarize_and_update_long_distance_info()
-
-            slow_thinking_traffic_log_roots = []
-            prompt_agent_id_list = []
-            system_prompt = "You are a traffic signal expert responsible for managing a four-way intersection. Your primary goal is to assess the current coordination level and implement appropriate signal selection strategies. Aim to optimize traffic flow and safety, considering not only your intersection but also the impacts on adjacent upstream and downstream intersections.\n"
-
 
             action_list = [None] * len(self.agent_intersection_list)
             
             ## decision making
             decision_making_intersection_id_list = []
-            decision_making_batch_prompt_list = []
             for inter_id, inter_agent in enumerate(self.agent_intersection_list):
                 state = current_states[inter_id]
                 car_exist = 0
@@ -314,38 +281,16 @@ class CoLLMLight:
                     action_list[inter_id] = action2code(signal)
                 else:
                     decision_making_intersection_id_list.append(inter_id)
-                    decision_making_batch_prompt_list.append(inter_agent.multi_level_decision_making_prompt(effective_range_list))
-
-            if len(decision_making_batch_prompt_list) > 0:
-                print("{} non-empty intersections thinking ...".format(len(decision_making_batch_prompt_list)))
-                inference_num = len(decision_making_batch_prompt_list)
+                    
+            inference_num = len(decision_making_intersection_id_list)
+            if len(decision_making_intersection_id_list) > 0:
+                print("Time step {}: {} non-empty intersections decision making ...".format(step_num, inference_num))
                 total_inference_ct += inference_num
-                infer_start_time = time.time()
-                action_list, decision_making_response_list, coordination_distribution = self.multi_level_decision_making_batch(action_list, decision_making_batch_prompt_list, decision_making_intersection_id_list)
-                infer_time = time.time() - infer_start_time
-                total_inference_time += infer_time
-                avg_infer_time = (time.time() - infer_start_time)/len(decision_making_batch_prompt_list)
-                avg_infer_speed.append(avg_infer_time)
-                n_ct = n_ct + int(inference_num * coordination_distribution['NO'])
-                s_ct = s_ct + int(inference_num * coordination_distribution['Simple'])
-                c_ct = c_ct + int(inference_num * coordination_distribution['Complex'])
-
-                ## print the distribution of coordination scenario 
-                print('avg_infer_time: {:.2f}s'.format(avg_infer_time))
-                print('no-coordination: {:.2f}%'.format(coordination_distribution['NO']))
-                print('simple: {:.2f}%'.format(coordination_distribution['Simple']))
-                print('complex: {:.2f}%'.format(coordination_distribution['Complex']))
-                no_coordination_history.append(coordination_distribution['NO'])
-                simple_coordination_history.append(coordination_distribution['Simple'])
-                complex_coordination_history.append(coordination_distribution['Complex'])
-                # self.plot_coordination_distribution(  
-                #     no_coordination_history,   
-                #     simple_coordination_history,   
-                #     complex_coordination_history,  
-                #     avg_infer_speed, 
-                #     total_step_num
-                # )  
-
+                action_list, decision_making_messages_list, atr_score_list, time_cost = self.Asynchronous_Reasoning_and_Acting(action_list, decision_making_intersection_id_list, step_num)
+                total_atr_time += time_cost['atr']
+                total_ra_time += time_cost['ra']
+                # print time cost
+                # print('Batch size: {}. Time cost: ATR {:.2f}s, RA {:.2f}s'.format(inference_num, time_cost['atr'], time_cost['ra']))
 
             # be sure all action is not None
             llm_fail_num = len([x for x in action_list if x == None])
@@ -353,39 +298,34 @@ class CoLLMLight:
             print('LLM fail num: {}'.format(llm_fail_num))
             for i, action in enumerate(action_list):
                 if action == None:
-                    # state = current_states[i]
-                    # effective_range_list = self.estimate_effective_range_new(state)
-                    # signal = self.agent_intersection_list[i].select_signal_default(effective_range_list)
-                    # action_list[i] = action2code(signal)
                     action_list[i] = action2code('ETWT')
 
+            # save LLM messages and atr_score
             for inter_id, inter_name in enumerate(self.intersection_list):
                 prompt_response_dict = {}
                 prompt_response_dict['step'] = step_num
                 if inter_id in decision_making_intersection_id_list:
-                    prompt_response_dict['step'] = step_num
-                    prompt_response_dict['decision_making_prompt'] = decision_making_batch_prompt_list[decision_making_intersection_id_list.index(inter_id)]
-                    prompt_response_dict['decision_making_responses'] = decision_making_response_list[decision_making_intersection_id_list.index(inter_id)]
-                if len(prompt_response_dict) > 1:
+                    prompt_response_dict['decision_making_messages'] = decision_making_messages_list[decision_making_intersection_id_list.index(inter_id)]
+                    prompt_response_dict['atr_score'] = atr_score_list[decision_making_intersection_id_list.index(inter_id)]
                     self.history_data['llm_resulst'][inter_name].append(prompt_response_dict)
-            # self.save_llm_response_data(self.history_data['llm_resulst'])
+            self.save_llm_response_data(self.history_data['llm_resulst'])
             
             next_state, _, done, _ = self.env.step(action_list)
             next_states, next_outputs = self.process_state(next_state)
             last_action_list = action_list[:]
             # self.save_action_log(current_states, action_list, next_states, step_num)
             
-            self.update_history_data(current_states, next_states, current_outputs, next_outputs, action_list)
-            global_indicator = {}
-            global_indicator['release'] = self.history_data['release_car_num'][-1]
-            global_indicator['input'] = self.history_data['input_car_num'][-1]
+            # self.update_history_data(current_states, next_states, current_outputs, next_outputs, action_list)
+            # global_indicator = {}
+            # global_indicator['release'] = self.history_data['release_car_num'][-1]
+            # global_indicator['input'] = self.history_data['input_car_num'][-1]
             # self.global_control_agent.update_state(global_indicator)
 
-            print("all_lane_current_release: {}, max_release: {}".format(self.history_data['release_car_num'][-1], max(self.history_data['release_car_num'])))
-            print("all_lane_current_input: {}, max_input: {}".format(self.history_data['input_car_num'][-1], max(self.history_data['input_car_num'])))
-            # print("current_car_num: {}, max_car_num: {}".format(self.history_data['car_num'][-1], max(self.history_data['car_num'])))
+            # print("all_lane_current_release: {}, max_release: {}".format(self.history_data['release_car_num'][-1], max(self.history_data['release_car_num'])))
+            # print("all_lane_current_input: {}, max_input: {}".format(self.history_data['input_car_num'][-1], max(self.history_data['input_car_num'])))
+            # # print("current_car_num: {}, max_car_num: {}".format(self.history_data['car_num'][-1], max(self.history_data['car_num'])))
             
-            print("current_car_num_ool: {}, max_car_num_ool: {}".format(self.history_data['car_num_out_of_lane'][-1], max(self.history_data['car_num_out_of_lane'])))
+            # print("current_car_num_ool: {}, max_car_num_ool: {}".format(self.history_data['car_num_out_of_lane'][-1], max(self.history_data['car_num_out_of_lane'])))
             
             print("total llm fail num: {}".format(self.llm_fail_ct))
             if self.my_config['llm_type'] == 'gpt':
@@ -429,8 +369,8 @@ class CoLLMLight:
             self.history_data['perf']['ATT'].append(att)
             # print("ql statistics: mean: {}, var: {}, min: {}, max: {}, 0ql_num: {}, Max_Avg_ql_cells: {}, Avg_ql_cells: {}".format(round(np.mean(queue_length_inter),4), round(np.var(queue_length_inter),4), round(np.min(queue_length_inter),4), round(np.max(queue_length_inter),4), (queue_length_inter==0).sum(), round(np.max(self.history_data["avg_ql_cells"][-1]),4), round(np.mean(self.history_data["avg_ql_cells"][-1]),4)))
             # boundary release and input statistics
-            self.show_boundary_data()
-            self.show_car_num()
+            # self.show_boundary_data()
+            # self.show_car_num()
             last_veh_num = veh_num
             # self.visualize(next_states)
             # self.save_performance_data(self.history_data['perf'])
@@ -438,10 +378,6 @@ class CoLLMLight:
         total_travel_time = self.calc_avg_travel_time()
         throughput = self.calc_throughput()
         
-        t_ct = n_ct+s_ct+c_ct
-        n_ratio = n_ct/t_ct if t_ct > 0 else 0
-        s_ratio = s_ct/t_ct if t_ct > 0 else 0
-        c_ratio = c_ct/t_ct if t_ct > 0 else 0
         results = {
             "test_reward_over": total_reward,
             "test_throughput_over": throughput,
@@ -450,12 +386,11 @@ class CoLLMLight:
             "test_avg_waiting_time_over": np.mean(waiting_time_episode) if len(queue_length_episode) > 0 else 0,
             "test_avg_travel_time_over": total_travel_time, 
             "LLM fail num": self.llm_fail_ct,
-            "total_inference_ct": total_inference_ct,
-            "total_inference_time": total_inference_time,
-            "avg_inference_time": total_inference_time/total_inference_ct,
-            "n_ratio": n_ratio,
-            "s_ratio": s_ratio,
-            "c_ratio": c_ratio}
+            "total_atr_time": total_atr_time,
+            "total_ra_time": total_ra_time,
+            "avg_atr_time": total_atr_time/total_inference_ct,
+            "avg_ra_time": total_ra_time/total_inference_ct,
+            "total_inference_ct": total_inference_ct}
         logger.log(results)
         os.makedirs('./results/latest_results', exist_ok=True)
         with open('./results/latest_results/{}.txt'.format(self.out_file_name), 'w') as f:
@@ -469,6 +404,124 @@ class CoLLMLight:
         self.env.batch_log_2()
 
         return results
+    
+    def Asynchronous_Reasoning_and_Acting(self, action_list, decision_making_intersection_id_list, step_num):
+        # 1st stage Advance Traffic Reasoning  
+
+        advance_traffic_reasoning_output_list, advance_traffic_reasoning_messages_list, atr_total_time_cost = self.advance_traffic_reasoning(decision_making_intersection_id_list, step_num)
+        print("atr done: {:.2f} s".format(atr_total_time_cost))
+
+        # 2nd stage Reactive Action  
+        action_list, reactive_action_messages_list, atr_score_list, ra_total_time_cost = self.reactive_action(action_list, advance_traffic_reasoning_output_list, decision_making_intersection_id_list, step_num)
+        print("ra done: {:.2f} s".format(ra_total_time_cost))
+        total_messages_list = [advance_traffic_reasoning_messages_list[i] + action_message for i, action_message in enumerate(reactive_action_messages_list)]
+        
+        time_cost = {}
+        time_cost['atr'] = atr_total_time_cost
+        time_cost['ra'] = ra_total_time_cost
+        return action_list, total_messages_list, atr_score_list, time_cost
+    
+    def advance_traffic_reasoning(self, decision_making_intersection_id_list, step_num):
+        decision_making_1st_prompts_list = []
+        for inter_id in decision_making_intersection_id_list:
+            agent = self.agent_intersection_list[inter_id]
+            decision_making_1st_prompts_list.append(agent.advance_traffic_reasoning_prompt(step_num))
+        atr_start_time = time.time()
+        if self.disable_psr:
+            advance_traffic_reasoning_output_list = ["" for _ in range(len(decision_making_1st_prompts_list))]
+
+        else:
+            advance_traffic_reasoning_output_list = self.LLM.batch_ask(decision_making_1st_prompts_list, system_prompt=SYSTEM_PROMPT, disable_thinking=True)
+        # 提取 </think> 标签后的内容
+            advance_traffic_reasoning_output_list = [self.extract_after_think_tag(output) for output in advance_traffic_reasoning_output_list]
+            
+
+        atr_total_time_cost = time.time()-atr_start_time
+        advance_traffic_reasoning_messages_list = []
+        for i in range(len(decision_making_intersection_id_list)):
+            messages = [{"role": "user", "content": decision_making_1st_prompts_list[i]},
+                        {"role": "assistant", "content": advance_traffic_reasoning_output_list[i]}]
+            advance_traffic_reasoning_messages_list.append(messages)
+        return advance_traffic_reasoning_output_list, advance_traffic_reasoning_messages_list, atr_total_time_cost
+
+    def reactive_action(self, action_list, advance_traffic_reasoning_output_list, decision_making_intersection_id_list, step_num):
+        decision_making_2st_prompts_list = []
+        for i, inter_id in enumerate(decision_making_intersection_id_list):
+            agent = self.agent_intersection_list[inter_id]
+            decision_making_2st_prompts_list.append(agent.reactive_action_prompt(advance_traffic_reasoning_output_list[i], step_num))
+        ra_start_time = time.time()
+        reactive_action_output_list = self.LLM.batch_ask(decision_making_2st_prompts_list, system_prompt=SYSTEM_PROMPT, disable_thinking=True)
+        ra_total_time_cost = time.time()-ra_start_time
+        
+        reactive_action_messages_list = []
+        atr_score_list = []
+        for i, inter_id in enumerate(decision_making_intersection_id_list):
+            messages = [{"role": "user", "content": decision_making_2st_prompts_list[i]},
+                        {"role": "assistant", "content": reactive_action_output_list[i]}]
+            reactive_action_messages_list.append(messages)
+            results = self.extract_json_reactive_action_results(reactive_action_output_list[i])
+            if results['signal'] in self.signal_list:
+                action_list[inter_id] = self.signal_list.index(results['signal'])
+            atr_score_list.append(results['used_atr'])
+
+            
+        return action_list, reactive_action_messages_list, atr_score_list, ra_total_time_cost
+    
+    def extract_after_think_tag(self, text):
+        """
+        提取 </think> 标签后面的内容，如果没有该标签则返回原始字符串。
+        """
+        tag = "</think>"
+        if tag in text:
+            return text.split(tag, 1)[1].strip()
+        return text
+    
+    def extract_json_reactive_action_results(self, response):
+        """
+        从LLM的响应中提取JSON格式的信号选择结果。
+        此版本经过优化，可以处理可选的markdown代码块，并且对JSON键名大小写不敏感。
+        
+        返回:
+            一个包含 'signal', 'reason', 和 'used_atr' 字段的字典。
+        """
+        try:
+            json_data = None
+            # 1. 优先尝试从 ```json ... ``` 代码块中提取JSON
+            match = re.search(r"```json\s*({.*?})\s*```", response, re.DOTALL)
+            if match:
+                json_data = match.group(1)
+            else:
+                # 2. 如果没有找到代码块，则在整个字符串中查找第一个有效的JSON对象
+                match = re.search(r"({.*})", response.strip(), re.DOTALL)
+                if match:
+                    json_data = match.group(1)
+
+            if json_data:
+                # 解析提取到的JSON字符串
+                data = json.loads(json_data)
+                
+                # *** 新增：将所有键转换为小写，以实现大小写不敏感 ***
+                data_lower = {k.lower(): v for k, v in data.items()}
+                
+                # 使用处理过的字典安全地获取值
+                result = {
+                    'signal': data_lower.get('signal'),
+                    'reason': data_lower.get('reason'),
+                    'used_atr': data_lower.get('used_atr', 0)
+                }
+                return result
+            
+            else:
+                # 如果在响应中找不到任何JSON数据
+                return {'signal': None, 'reason': None, 'used_atr': 0}
+                
+        except json.JSONDecodeError:
+            # 如果JSON格式错误
+            return {'signal': None, 'reason': None, 'used_atr': 0}
+        except Exception:
+            # 捕获其他未知异常
+            return {'signal': None, 'reason': None, 'used_atr': 0}
+
     
     def plot_coordination_distribution(self, no_coordination_history, simple_coordination_history, complex_coordination_history, avg_infer_speed, total_step_num):  
         # Create the directory if it doesn't exist  
@@ -635,418 +688,28 @@ class CoLLMLight:
 
         return action_list, medium_thinking_response
 
-    def slow_thinking_batch(self, slow_batch_prompt_list, slow_thinking_intersection_id_list):
-        lane_results = {}
-        responses = {}
-        signal_results = {}
-        batch_prompt_dict_list = deepcopy(slow_batch_prompt_list)
-        for depth in range(1, self.future_inference_depth+1):
-            ## 1. batch prompt
-            slow_thinking_response = []
-            batch_prompt = []
-            prompt_locations = []
-            print("slow thinking depth: ", depth)
-            for i, prompt_dict in enumerate(batch_prompt_dict_list):
-                for lane in prompt_dict:
-                    for action_chain in prompt_dict[lane]:
-                        prompt = prompt_dict[lane][action_chain]['prompt']
-                        batch_prompt.append(prompt)
-                        prompt_locations.append([slow_thinking_intersection_id_list[i], lane, action_chain])
-            print('reasoning steps: ', len(batch_prompt))
-            if len(batch_prompt) >= 100:
-                for i in range(0, len(batch_prompt), 100):
-                    batch_response = self.LLM.batch_ask(batch_prompt[i:i+100])
-                    slow_thinking_response.extend(batch_response)
-            else:
-                slow_thinking_response = self.LLM.batch_ask(batch_prompt)
-
-            ## 2. extract summary
-            slow_thinking_summary_batch = self.extract_traffic_summaries(slow_thinking_response)
-            for i, location in enumerate(prompt_locations):
-                inter_id = location[0]
-                lane = location[1]
-                action_chain = location[2]
-                if inter_id not in lane_results:
-                    responses[inter_id] = {}
-                    lane_results[inter_id] = {}
-                if lane not in lane_results[inter_id]:
-                    responses[inter_id][lane] = {}
-                    lane_results[inter_id][lane] = {}
-                lane_results[inter_id][lane][action_chain] = slow_thinking_summary_batch[i]
-                responses[inter_id][lane][action_chain] = slow_thinking_response[i]
-            
-            ## 3. next depth reasoning prompt
-            new_batch_prompt_dict_list = []
-            for i, prompt_dict in enumerate(batch_prompt_dict_list):
-                inter_id = slow_thinking_intersection_id_list[i]
-                new_prompt_dict = {}
-                for lane in prompt_dict:
-                    new_prompt_dict[lane] = {}
-                    for old_action_chain in prompt_dict[lane]:
-                        for action in ['Activate', 'Restrict']:
-                            action_chain = old_action_chain + '-' + action
-                            new_prompt_dict[lane][action_chain] = {}
-                            new_prompt_dict[lane][action_chain]['prompt'] = self.get_new_slow_thinking_prompt(prompt_dict[lane][old_action_chain]['prompt'], responses[inter_id][lane][old_action_chain], lane, action)
-                new_batch_prompt_dict_list.append(new_prompt_dict)
-            batch_prompt_dict_list = new_batch_prompt_dict_list
-
-        # lane_results -> signal_results
-        for inter_id in lane_results:
-            signal_results[inter_id] = {}
-            for depth in range(1, self.future_inference_depth+1):
-                for signal in self.signal_list:
-                    if depth == 1:
-                        new_signal_chains = [signal]
-                    else:
-                        new_signal_chains = []
-                        for old_signal_chain in signal_results[inter_id]:
-                            if len(old_signal_chain.split('-')) == depth-1:
-                                new_signal_chains.append(old_signal_chain + '-' + signal)
-                    for signal_chain in new_signal_chains:
-                        signal_results[inter_id][signal_chain] = self.lane_results2signal_results(lane_results[inter_id], signal_chain)
-        slow_thinking_result_text_list = self.construct_slow_thinking_result_text(signal_results, responses, lane_results)
-        return slow_thinking_result_text_list
     
-    def slow_thinking_decision_batch(self, action_list, slow_thinking_result_text_list, slow_thinking_intersection_id_list):
-        system_prompt = "You are a traffic signal controller at a four-way intersection with 12 lanes: [NL, NT, NR, SL, ST, SR, EL, ET, ER, WL, WT, WR]. Each lane is labeled by direction and movement: N for north, S for south, E for east, W for west, L for left turn, T for through, and R for right turn. For instance, ET stands for the East Through lane, where traffic moves straight ahead from east to west. WL is the West Left-turn lane, where traffic turns left from west to south. Right turns are always allowed. There are four signal options: [ETWT, NTST, ELWL, NLSL]. For example, ETWT indicates the release of both the ET and WT lanes. Your goal is to optimize traffic flow and coordinate with nearby intersections to minimize wait times and queues by selecting the best signal phases based on current conditions.\n"
-        slow_thinking_decision_responses = self.LLM.batch_ask(slow_thinking_result_text_list, system_prompt)
-        for i, inter_id in enumerate(slow_thinking_intersection_id_list):
-            answer = extract_answer_by_tag("answer", slow_thinking_decision_responses[i])
-            if answer in self.signal_list:
-                action_list[inter_id] = action2code(answer)
-        
-        return action_list, slow_thinking_decision_responses
-            
-
-
-    def construct_slow_thinking_result_text(self, signal_results, responses, lane_results):
-        slow_thinking_result_text_list = []
-        for i, inter_id in enumerate(signal_results):
-            slow_thinking_result_text = self.lane_results_text2signal_result_text(signal_results[inter_id], responses[inter_id])
-            slow_thinking_result_text_list.append(slow_thinking_result_text)
-        return slow_thinking_result_text_list
-
-    def lane_results_text2signal_result_text(self, signal_results, responses):
-        text = "###**Signal Consequence Prediction: **\n" 
-        for signal in signal_results:
-            activate_lanes = [signal[:2], signal[2:]]
-            text += "**Signal: " + signal + "**\n"
-            text += "|Lane|Cars Input|Cars Output|Queued Cars Change|Queued Cars|Moving Cars Change|Moving Cars|Average Waiting Time Change (mins)|Average Waiting Time (mins)|Occupancy Change|Occupancy|\n"
-            for lane in responses:
-                action = 'Activate' if lane in activate_lanes else 'Restrict'
-                text += self.extract_slow_thinking_state(responses[lane][action])
-            text += "\n"
-        return text
-
-    
-    def extract_slow_thinking_state(self, text):
-        start_index = text.find("|Occupancy|\n")
-        end_index = text.find("Summary:")
-        extracted_text = text[start_index+len('|Occupancy|\n'):end_index]
-        return extracted_text
-
-            
-                        
-        # update action list
-        # for inter_id in slow_thinking_intersection_id_list:
-        #     signal_chain_options = []
-        #     if inter_id not in signal_results:
-        #         continue
-        #     for signal_chain in signal_results[inter_id]:
-        #         if len(signal_chain.split('-')) == self.future_inference_depth:
-        #             signal_chain_options.append(signal_chain)
-        #     signal_results_no_over_occupancy = []
-        #     signal_results_no_over_occupancy_and_small_wait_time = []
-        #     for signal_chain in signal_chain_options:
-        #         if signal_results[inter_id][signal_chain]['Over Occupancy'] == False:
-        #             signal_results_no_over_occupancy.append(signal_chain)
-        #             if signal_results[inter_id][signal_chain]['Max Average Waiting Time'] <= 3:
-        #                 signal_results_no_over_occupancy_and_small_wait_time.append(signal_chain)
-        #     if len(signal_results_no_over_occupancy_and_small_wait_time) > 0:
-        #         # sort signal_results_no_over_occupancy_and_small_wait_time by total_cars_output
-        #         signal_results_no_over_occupancy_and_small_wait_time.sort(key=lambda x: (
-        #             -signal_results[inter_id][x]['Total Queued Length'],
-        #             signal_results[inter_id][x]['Total Cars Output'],
-        #             -signal_results[inter_id][x]['Max Average Waiting Time']
-                    
-        #         ), reverse=True)
-        #         best_signal_chain = signal_results_no_over_occupancy_and_small_wait_time[0]
-        #         best_signal = best_signal_chain.split('-')[0]
-        #         action_list[inter_id] = action2code(best_signal)
-        #     elif len(signal_results_no_over_occupancy) > 0:
-        #         # sort signal_results_no_over_occupancy by total_cars_output
-        #         signal_results_no_over_occupancy.sort(key=lambda x: (
-        #             -signal_results[inter_id][x]['Max Average Waiting Time'], 
-        #             -signal_results[inter_id][x]['Total Queued Length'],
-        #             signal_results[inter_id][x]['Total Cars Output']
-        #         ), reverse=True)
-        #         best_signal_chain = signal_results_no_over_occupancy[0]
-        #         best_signal = best_signal_chain.split('-')[0]
-        #         action_list[inter_id] = action2code(best_signal)
-        #     else:
-        #         signal_chain_options.sort(key=lambda x: (
-        #             signal_results[inter_id][x]['Max Average Waiting Time'],
-        #             -signal_results[inter_id][x]['Total Queued Length'],
-        #             signal_results[inter_id][x]['Total Cars Output']
-        #         ), reverse=True)
-        #         best_signal_chain = signal_chain_options[0]
-        #         best_signal = best_signal_chain.split('-')[0]
-        #         action_list[inter_id] = action2code(best_signal)
-                
-        # return action_list, responses
-
-
-
-    def lane_results2signal_results(self, lane_results, signal_chain):
-        signal_chain_list = signal_chain.split('-')
-        summary_dict = {}
-        Total_Cars_Output = 0
-        Over_Occupancy = False
-        Total_Queued_Length = 0
-        Max_Average_Waiting_Time = 0
-        lane_action_chain = {}
-
-        for i, signal in enumerate(signal_chain_list):
-            activate_lanes = [signal[:2], signal[2:]]
-            if i == 0:
-                for lane in location_direction_dict:
-                    if lane in activate_lanes:
-                        lane_action_chain[lane] = 'Activate'
-                    else:
-                        lane_action_chain[lane] = 'Restrict'
-            else:
-                for lane in location_direction_dict:
-                    if lane in activate_lanes:
-                        lane_action_chain[lane] = lane_action_chain[lane] + '-' + 'Activate'
-                    else:
-                        lane_action_chain[lane] = lane_action_chain[lane] + '-' + 'Restrict'
-            for lane in location_direction_dict:
-                action_chain = lane_action_chain[lane]
-                if lane in lane_results:
-                    if action_chain in lane_results[lane]:
-                        if lane_results[lane][action_chain] != None:
-                            Total_Cars_Output += lane_results[lane][action_chain]['Total Cars Output']
-                            if lane_results[lane][action_chain]['Over Occupancy'] == True:
-                                Over_Occupancy = True
-                            Total_Queued_Length += lane_results[lane][action_chain]['Total Queued Length']
-                            Max_Average_Waiting_Time = max(Max_Average_Waiting_Time, lane_results[lane][action_chain]['Max Average Waiting Time'])
-
-        summary_dict['Total Cars Output'] = Total_Cars_Output/len(signal_chain_list)
-        summary_dict['Over Occupancy'] = Over_Occupancy
-        summary_dict['Total Queued Length'] = Total_Queued_Length/len(signal_chain_list)
-        summary_dict['Max Average Waiting Time'] = Max_Average_Waiting_Time
-        return summary_dict
-
-
-                
-
-
-
-        
-
-
-
-
-
-
-
-
-        
-        ## 3. summarize and update signal results in this timestep
-
-        ## 4. update action list based on signal results.
-
-    def get_new_slow_thinking_prompt(self, prompt, response, lane, action):
-        previous_text = prompt[:-len("<Your Prediction>")] + response + "\n"
-        timesteps = re.findall(r"Timestep:\s*(\d+)", previous_text)
-        last_timestep = int(timesteps[-1])
-        timestep = last_timestep + 1
-        new_signal_text = "Timestep: " + str(timestep) + "\n"
-        new_signal_text += "Action: " + str(lane) + ' ' + str(action) + "\n"
-        new_signal_text += "<Your Prediction>"
-        return prompt + new_signal_text
 
     
 
-    def slow_thinking_batch_old(self, slow_thinking_traffic_log_roots):
-        ## slow_thinking_results
-        ## [i][signal_chain] - > traffic_text, summary
-        instruction = "You're a traffic expert at a four-way intersection. You need to directly infer the next traffic state changes using prior traffic data and the given signal. \n"
-        slow_thinking_prompt_batch = []
-        slow_thinking_results = []
 
-        for i in range(len(slow_thinking_traffic_log_roots)):
-            results = []
-            slow_thinking_results.append(results)
-        slow_thinking_revious_texts = self.get_slow_thinking_root_prompts(slow_thinking_traffic_log_roots)
-                
-        slow_thinking_queue = []
-        for i, slow_thinking_revious_text in enumerate(slow_thinking_revious_texts):
-            item = {}
-            item['prompt_id_chain'] = [i, []]
-            item['traffic_text'] = slow_thinking_revious_text
-            slow_thinking_queue.append(item)
-                    
-        for depth in range(self.future_inference_depth):
-            print("slow thinking depth: ", depth+1)
-            slow_thinking_prompt_batch = []
-            slow_thinking_prompt_id = []
-            for item in slow_thinking_queue:
-                slow_thinking_results_id, slow_thinking_signal_chain = item['prompt_id_chain'][0], item['prompt_id_chain'][1]
-                slow_thinking_revious_text = item['traffic_text']  
-                for signal in self.signal_list:
-                    slow_thinking_prompt_batch.append(self.get_traffic_thinking_prompt(slow_thinking_revious_text, signal))
-                    slow_thinking_prompt_id.append((slow_thinking_results_id, slow_thinking_signal_chain + [signal]))
-            slow_thinking_queue = []
-            print("thinking steps: ", len(slow_thinking_prompt_batch))
-            if len(slow_thinking_prompt_batch) >= 100:
-                slow_thinking_prompt_response = []
-                for i in range(0, len(slow_thinking_prompt_batch), 100):
-                    batch_response = self.LLM.batch_ask(slow_thinking_prompt_batch[i:i+100], instruction)
-                    slow_thinking_prompt_response.extend(batch_response)
-            else:
-                slow_thinking_prompt_response = self.LLM.batch_ask(slow_thinking_prompt_batch, instruction)
-            slow_thinking_summaries = self.extract_traffic_summaries(slow_thinking_prompt_response)
-            min_aql_dict = {}
-            for i in range(len(slow_thinking_summaries)):
-                if slow_thinking_summaries[i] == None:
-                    self.llm_fail_ct += 1
-                    continue
-                slow_thinking_results_id, slow_thinking_signal_chain = slow_thinking_prompt_id[i][0], slow_thinking_prompt_id[i][1]
-                slow_thinking_signal_chain_dict = {}
-                signal_chain_str = str(slow_thinking_results_id) + ':' + ','.join(slow_thinking_signal_chain[:-1])
-                slow_thinking_signal_chain_dict['signal_chain'] = slow_thinking_signal_chain
-                slow_thinking_signal_chain_dict['summary'] = slow_thinking_summaries[i]
-                slow_thinking_signal_chain_dict['traffic_text'] = slow_thinking_prompt_batch[i] + slow_thinking_prompt_response[i]
-                slow_thinking_results[slow_thinking_results_id].append(slow_thinking_signal_chain_dict)
-                if signal_chain_str not in min_aql_dict:
-                    min_aql_dict[signal_chain_str] = slow_thinking_signal_chain_dict['summary']['Average Queued Length']
-                elif min_aql_dict[signal_chain_str] > slow_thinking_signal_chain_dict['summary']['Average Queued Length']:
-                    min_aql_dict[signal_chain_str] = slow_thinking_signal_chain_dict['summary']['Average Queued Length']
 
-                if slow_thinking_signal_chain_dict['summary']['Over Occupancy'] == False:
-                    if depth > 0:
-                        if slow_thinking_signal_chain_dict['summary']['Average Queued Length'] == min_aql_dict[signal_chain_str]:
-                            slow_thinking_queue.append({'prompt_id_chain': [slow_thinking_results_id, slow_thinking_signal_chain], 'traffic_text': slow_thinking_signal_chain_dict['traffic_text']})
-                    else:
-                        slow_thinking_queue.append({'prompt_id_chain': [slow_thinking_results_id, slow_thinking_signal_chain], 'traffic_text': slow_thinking_signal_chain_dict['traffic_text']})
-        return slow_thinking_results
+
     
 
 
-    def get_slow_thinking_root_prompts(self, slow_thinking_traffic_log_roots):
-        slow_thinking_revious_texts = []
-        for slow_thinking_traffic_log_root in slow_thinking_traffic_log_roots:
-            slow_thinking_revious_texts.append(self.get_traffic_text(slow_thinking_traffic_log_root))
-        return slow_thinking_revious_texts
-
-    def get_traffic_text(self, traffic_logs):
-        input_text = "##Information\n"
-        input_text += "Eight lanes can be activated: [NL, NT, SL, ST, EL, ET, WL, WT]. When a lane is activated, cars in that lane will have 30 seconds to move to one of the downstream lanes, one by one. \nFor each data, the 'change' shows how much it has increased or decreased compared to the previous time step. \n(Intersection ID, lane) refers to the lane of another intersection that is located upstream or downstream of your lane.\n'Over Occupancy' refers to occupancy exceeding 100%.\n\n"
-        for history in traffic_logs:
-            timestep = history['timestep']
-            timestep_data = history['traffic_state']
-            input_text += "##Traffic Data\n"
-            input_text += "Timestep: " + str(timestep) + "\n"
-            input_text += "Activate Lanes: " + str(timestep_data['Signal'][:2]) +', ' + str(timestep_data['Signal'][2:]) + "\n"
-            input_text += "|Lane|Cars Input|Cars Output|Queued Cars Change|Queued Cars|Moving Cars Change|Moving Cars|Average Waiting Time Change (mins)|Average Waiting Time (mins)|Occupancy Change|Occupancy|\n"
-            for key in list(timestep_data.keys()):
-                if key in ['Signal', 'Summary']:
-                    continue
-                input_text += f"|{key}|{timestep_data[key]['Cars Input']}|{timestep_data[key]['Cars Output']}|{timestep_data[key]['Queued Cars Change']}|{timestep_data[key]['Queued Cars']}|{timestep_data[key]['Moving Cars Change']}|{timestep_data[key]['Moving Cars']}|{timestep_data[key]['Average Waiting Time Change (mins)']}|{timestep_data[key]['Average Waiting Time (mins)']}|{timestep_data[key]['Occupancy Change (%)']}|{timestep_data[key]['Occupancy (%)']}|\n"
-            input_text += "Summary: \n"
-            input_text += "- Total Cars Output: " + str(timestep_data['Summary']['Total Cars Output']) + "\n"
-            input_text += "- Over Occupancy: " + str(timestep_data['Summary']['Over Occupancy']) + "\n"
-            input_text += "- Average Queued Length: " + str(timestep_data['Summary']['Average Queued Length']) + "\n"
-            input_text += "- Max Average Waiting Time: " + str(timestep_data['Summary']['Max Average Waiting Time']) + "\n"
-            input_text += "\n"
-            # timestep += 1
-        # timestep += 1    
-        # input_text += "Timestep: " + str(timestep) + "\n"
-        # input_text += "Activate Lanes: " + str(current_data['Signal'][:2]) +', ' + str(current_data['Signal'][2:]) + "\n"
-        # input_text += "<Your Prediction>"
-        # output_text = "|Lane|Cars Input|Cars Output|Queued Cars Change|Queued Cars|Moving Cars Change|Moving Cars|Average Waiting Time Change (mins)|Average Waiting Time (mins)|Occupancy Change|Occupancy|\n"
-        # for key in list(current_data.keys()):
-        #     if key in ['Signal', 'Summary']:
-        #         continue
-        #     output_text += f"|{key}|{current_data[key]['Cars Input']}|{current_data[key]['Cars Output']}|{current_data[key]['Queued Cars Change']}|{current_data[key]['Queued Cars']}|{current_data[key]['Moving Cars Change']}|{current_data[key]['Moving Cars']}|{current_data[key]['Average Waiting Time Change (mins)']}|{current_data[key]['Average Waiting Time (mins)']}|{current_data[key]['Occupancy Change (%)']}|{current_data[key]['Occupancy (%)']}|\n"
-        # output_text += "Summary: \n"
-        # output_text += "- Total Cars Output: " + str(current_data['Summary']['Total Cars Output']) + "\n"
-        # output_text += "- Over Occupancy: " + str(current_data['Summary']['Over Occupancy']) + "\n"
-        # output_text += "- Average Queued Length: " + str(current_data['Summary']['Average Queued Length']) + "\n"
-        # output_text += "- Max Average Waiting Time: " + str(current_data['Summary']['Max Average Waiting Time']) + "\n"
-        # output_text += "\n"
-        return input_text
-    def get_traffic_thinking_prompt(self, slow_thinking_previous_text, signal):
-        timesteps = re.findall(r"Timestep:\s*(\d+)", slow_thinking_previous_text)
-        last_timestep = int(timesteps[-1])
-        timestep = last_timestep + 1
-        new_signal_text = "Timestep: " + str(timestep) + "\n"
-        new_signal_text += "Activate Lanes: " + str(signal[:2]) +','+ str(signal[2:]) + "\n"
-        new_signal_text += "<Your Prediction>"
-        return slow_thinking_previous_text + new_signal_text
-
-    def extract_traffic_summaries(self, texts):
-        summaries = []
-        for text in texts:
-            summary = self.extract_traffic_summary(text)
-            summaries.append(summary)
-        return summaries
         
 
-    def extract_traffic_summary(self, text):
-        # 使用正则表达式查找所有的 "Summary" 部分
-
-        summaries = re.findall(r"Summary:\s+(- [^\n]+(?:\n- [^\n]+)*)", text, re.DOTALL)
-        if summaries:
-            # 获取最后一个 "Summary"
-            last_summary = summaries[-1]
-
-            # 提取各个数据项
-            total_cars_output_match = re.search(r"- Total Cars Output:\s+(\d+)", last_summary)
-            over_occupancy_match = re.search(r"- Over Occupancy:\s+(True|False)", last_summary)
-            total_queued_length_match = re.search(r"- Total Queued Length:\s+(\d+\.\d+)", last_summary)
-            max_average_waiting_time_match = re.search(r"- Max Average Waiting Time:\s+(\d+\.\d+)", last_summary)
-
-            # 构建字典
-            summary_data = {
-                "Total Cars Output": int(total_cars_output_match.group(1)) if total_cars_output_match else 0,
-                "Over Occupancy": over_occupancy_match.group(1) == "True" if over_occupancy_match else False,
-                "Total Queued Length": float(total_queued_length_match.group(1)) if total_queued_length_match else 0.0,
-                "Max Average Waiting Time": float(max_average_waiting_time_match.group(1)) if max_average_waiting_time_match else 0.0
-            }
-            return summary_data
-        else:
-            return None
-                
 
 
 
 
-    def get_up_down_stream_relation(self, inter_id):
-        upstream_relation = {'NT': ['North', ['NT', 'EL', 'WR']], 'NL': ['North', ['NT', 'EL', 'WR']], 'ET': ['East', ['ET', 'SL', 'NR']], 'EL': ['East', ['ET', 'SL', 'NR']], 'ST': ['South', ['ST', 'WL', 'ER']], 'SL': ['South', ['ST', 'WL', 'ER']], 'WT': ['West', ['WT', 'NL', 'SR']], 'WL': ['West', ['WT', 'NL', 'SR']]}
-        downstream_relation = {'NT': ['South', ['NR','NT','NL']], 'NL': ['East', ['WR', 'WT', 'WL']], 'ET': ['West', ['ER', 'ET', 'EL']], 'EL': ['South', ['NR','NT','NL']], 'ST': ['North', ['SR', 'ST', 'SL']], 'SL': ['West', ['ER', 'ET', 'EL']], 'WT': ['East', ['WR', 'WT', 'WL']], 'WL': ['North', ['SR', 'ST', 'SL']]} 
-        neighbor_list = self.get_neighbor_list(inter_id)
-        loc2id = {}
-        for neighbor in neighbor_list:
-            loc2id[neighbor['location']] = neighbor['id']
-        up_down_stream_relation = {}
-        for lane in location_direction_dict:
-            upstream_location = upstream_relation[lane][0]
-            upstream_lanes = upstream_relation[lane][1]
-            downstream_lanes = downstream_relation[lane][1]
-            downstream_location = downstream_relation[lane][0]
-            if upstream_location in loc2id:
-                upstream_id = loc2id[upstream_location]
-            else:
-                upstream_id = None
-            if downstream_location in loc2id:
-                downstream_id = loc2id[downstream_location]
-            else:
-                downstream_id = None
-            up_down_stream_relation[lane] = {'upstream_location': upstream_location, 'upstream_id': upstream_id, 'upstream_lanes': upstream_lanes, 'downstream_location': downstream_location,'downstream_id': downstream_id, 'downstream_lanes': downstream_lanes}
-        
-        return up_down_stream_relation
+
+
+
+
+
+
     
     def get_up_down_stream_view_from_trajectory(self, inter_id):
         view = {}
@@ -1404,7 +1067,11 @@ class CoLLMLight:
     
     def save_llm_response_data(self, data):
         # Load existing data
-        filename = f'./results/llm_responses_log/{self.out_file_name}.json'
+        directory = f'./results/llm_responses_log/'
+        filename = os.path.join(directory, f'{self.out_file_name}.json')
+        
+        # 确保目录存在（包括中间目录）
+        os.makedirs(directory, exist_ok=True)
         llm_data = {}    
         llm_data[self.memo] = data
         with open(filename, 'w') as f:
@@ -2014,11 +1681,11 @@ class CoLLMLight:
             else:
                 range_list.append(self.default_release_range)
         return range_list
+
     def estimate_effective_range_new(self, state):
-        car_speed = 11
+        car_speed = 11.11
         effective_range_distance = car_speed * self.signal_time
         range_list = []
-        
         for lane in location_direction_dict:
             road_length = state[lane]['road_length']
             seg_length = road_length/self.seg_num
@@ -2036,8 +1703,10 @@ class CoLLMLight:
         roads = deepcopy(intersection["roads"])
 
         neighbor_list = [inter for inter in self.env.traffic_light_node_dict[inter_name]['neighbor_ENWS'] if inter] #inter_name
+
         road_list = list(roads.keys())
         road2inter = [r.replace("road", "intersection")[:-2] for r in road_list] 
+        
         neighbor2loc = {inter: roads[road_list[i]]['location'] for i, inter in enumerate(road2inter) if inter in neighbor_list}
         for neighbor_inter_name in neighbor_list:
             n_list.append({"id":inter_list.index(neighbor_inter_name), "name":neighbor_inter_name,  "location":neighbor2loc[neighbor_inter_name]})

@@ -1,18 +1,27 @@
 import requests
 import json
+import os
 from transformers import AutoTokenizer
 import time
 
     
 class GPT_model:
-    def __init__(self, llm_params = {}, model = "gpt-3.5-turbo", key = None) -> None:
-        self.url = None ## you need to prepare your api key
-        self.key = key
-        if self.url is None or key is None:
-            raise ValueError("Please provide a valid API key and URL.")
+    def __init__(self, llm_params = {}, model = "gpt-3.5-turbo", key = None, url = None) -> None:
+        self.url = url or os.getenv("OPENAI_API_URL")
+        if self.url is None:
+            base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+            self.url = f"{base_url}/chat/completions"
+
+        self.key = key or os.getenv("OPENAI_API_KEY")
+        if self.key is None:
+            raise ValueError("Please set OPENAI_API_KEY or pass key explicitly.")
+
+        authorization = self.key
+        if not authorization.lower().startswith("bearer "):
+            authorization = f"Bearer {authorization}"
         self.headers = {
             "Content-Type": "application/json",
-            "Authorization": key
+            "Authorization": authorization
             
         }
         self.model = model
@@ -35,9 +44,10 @@ class GPT_model:
             try:
                 response = requests.post(self.url, headers=self.headers, data=json.dumps(data))
                 response.raise_for_status()  # Ensure we raise an error for bad status codes
-                response_text = response.json()['choices'][0]['message']['content']
+                response_json = response.json()
+                response_text = response_json['choices'][0]['message']['content']
                 # print(response_text)
-                self.total_consume += response.json()['consume']
+                self.total_consume += response_json.get('consume', 0)
                 return response_text
             except requests.exceptions.RequestException as e:
                 # print(f"Request failed: {e}")
@@ -86,14 +96,22 @@ class LLAMA_model:
         }
         self.llm_params.update(llm_params)
 
-    def ask(self, user_prompt, system_prompt = 'You are a helpful AI assistant.'):
+    def ask(self, user_prompt, system_prompt = 'You are a helpful AI assistant.', disable_thinking = False):
         messages=[  {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}]
-        prompt = self.tokenizer.apply_chat_template(
+        if disable_thinking:
+            prompt = self.tokenizer.apply_chat_template(
                     messages,
                     tokenize=False,
-                    add_generation_prompt=True
+                    add_generation_prompt=True,
+                    enable_thinking=False
                 )
+        else:
+            prompt = self.tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True
+                    )
 
         data = {
         "prompt": prompt,
@@ -110,7 +128,7 @@ class LLAMA_model:
         except KeyError as e:
             return "Key error"
 
-    def batch_ask(self, user_prompts, system_prompt = 'You are a helpful AI assistant.'):
+    def batch_ask(self, user_prompts, system_prompt = 'You are a helpful AI assistant.', disable_thinking = False):
         messages_list = []
         batch_num = len(user_prompts)
         for user_prompt in user_prompts:
@@ -118,11 +136,19 @@ class LLAMA_model:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ]
-            prompt = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True
-            )
+            if disable_thinking:
+                prompt = self.tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=False
+                    )
+            else:
+                prompt = self.tokenizer.apply_chat_template(
+                            messages,
+                            tokenize=False,
+                            add_generation_prompt=True
+                        )
             messages_list.append(prompt)
 
         data = {

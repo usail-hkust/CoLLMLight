@@ -18,6 +18,7 @@ logs_transfer/
 records_case_study/
 records_transfer/
 memory/
+llm_weights
 *.sh
 /*.txt
 *.pyc

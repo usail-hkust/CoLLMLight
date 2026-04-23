@@ -16,21 +16,23 @@ location_dict_reverse = {"N": "North", "S": "South", "E": "East", "W": "West"}
 direction_dict = {"go_straight": "T", "turn_left": "L", "turn_right": "R"}
 
 class Intersection:
-    def __init__(self, inter_id, dic_traffic_env_conf, eng, light_id_dict, path_to_log, lanes_length_dict):
+    def __init__(self, inter_id, dic_traffic_env_conf, eng, all_intersection_neighbor_dict, light_id_dict, path_to_log, lanes_length_dict):
         self.inter_id = inter_id
         self.inter_name = "intersection_{0}_{1}".format(inter_id[0], inter_id[1])
         self.eng = eng
         self.dic_traffic_env_conf = dic_traffic_env_conf
         self.lane_length = lanes_length_dict
         self.obs_length = dic_traffic_env_conf["OBS_LENGTH"]
+        self.neighbor_dict = all_intersection_neighbor_dict
 
         self.list_approachs = ["W", "E", "N", "S"]
         # corresponding exiting lane for entering lanes
         self.dic_approach_to_node = {"W": 0, "E": 2, "S": 1, "N": 3}
-        self.dic_entering_approach_to_edge = {"W": "road_{0}_{1}_0".format(inter_id[0] - 1, inter_id[1])}
-        self.dic_entering_approach_to_edge.update({"E": "road_{0}_{1}_2".format(inter_id[0] + 1, inter_id[1])})
-        self.dic_entering_approach_to_edge.update({"N": "road_{0}_{1}_3".format(inter_id[0], inter_id[1] + 1)})
-        self.dic_entering_approach_to_edge.update({"S": "road_{0}_{1}_1".format(inter_id[0], inter_id[1] - 1)})
+        self.dic_entering_approach_to_edge = self._get_entering_approach_to_edge()
+        # self.dic_entering_approach_to_edge = {"W": "road_{0}_{1}_0".format(inter_id[0] - 1, inter_id[1])}
+        # self.dic_entering_approach_to_edge.update({"E": "road_{0}_{1}_2".format(inter_id[0] + 1, inter_id[1])})
+        # self.dic_entering_approach_to_edge.update({"N": "road_{0}_{1}_3".format(inter_id[0], inter_id[1] + 1)})
+        # self.dic_entering_approach_to_edge.update({"S": "road_{0}_{1}_1".format(inter_id[0], inter_id[1] - 1)})
         self.dic_exiting_approach_to_edge = {
             approach: "road_{0}_{1}_{2}".format(inter_id[0], inter_id[1], self.dic_approach_to_node[approach]) for
             approach in self.list_approachs}
@@ -92,6 +94,20 @@ class Intersection:
         self.all_red_flag = False
         self.all_yellow_flag = False
         self.flicker = 0
+    
+    def _get_entering_approach_to_edge(self):
+        # dic_approach_to_node = {"W": 0, "E": 2, "S": 1, "N": 3}
+        neighbors = self.neighbor_dict[self.inter_name]
+        dic_entering_approach_to_edge = {}
+        if 'W' in neighbors:
+            dic_entering_approach_to_edge.update({"W": "road_{0}_{1}_0".format(neighbors['W'].split("_")[1], neighbors['W'].split("_")[2])})
+        if 'E' in neighbors:
+            dic_entering_approach_to_edge.update({"E": "road_{0}_{1}_2".format(neighbors['E'].split("_")[1], neighbors['E'].split("_")[2])})
+        if 'N' in neighbors:
+            dic_entering_approach_to_edge.update({"N": "road_{0}_{1}_3".format(neighbors['N'].split("_")[1], neighbors['N'].split("_")[2])})
+        if 'S' in neighbors:
+            dic_entering_approach_to_edge.update({"S": "road_{0}_{1}_1".format(neighbors['S'].split("_")[1], neighbors['S'].split("_")[2])})
+        return dic_entering_approach_to_edge
 
     def set_signal(self, action, action_pattern, yellow_time, path_to_log):
         if self.all_yellow_flag:
@@ -161,11 +177,20 @@ class Intersection:
         self.dic_lane_vehicle_current_step_in = {}
         self.dic_lane_waiting_vehicle_count_current_step = {}
         for lane in self.list_entering_lanes:
-            self.dic_lane_vehicle_current_step_in[lane] = simulator_state["get_lane_vehicles"][lane]
-
+            if lane in simulator_state["get_lane_vehicles"]:
+                self.dic_lane_vehicle_current_step_in[lane] = simulator_state["get_lane_vehicles"][lane]
+            else:
+                self.dic_lane_vehicle_current_step_in[lane] = []
         for lane in self.list_lanes:
-            self.dic_lane_vehicle_current_step[lane] = simulator_state["get_lane_vehicles"][lane]
-            self.dic_lane_waiting_vehicle_count_current_step[lane] = simulator_state["get_lane_waiting_vehicle_count"][lane]
+            if lane in simulator_state["get_lane_vehicles"]:
+                self.dic_lane_vehicle_current_step[lane] = simulator_state["get_lane_vehicles"][lane]
+            else:
+                self.dic_lane_vehicle_current_step[lane] = []
+            
+            if lane in simulator_state["get_lane_waiting_vehicle_count"]:
+                self.dic_lane_waiting_vehicle_count_current_step[lane] = simulator_state["get_lane_waiting_vehicle_count"][lane]
+            else:
+                self.dic_lane_waiting_vehicle_count_current_step[lane] = 0
 
         self.dic_vehicle_speed_current_step = simulator_state["get_vehicle_speed"]
         self.dic_vehicle_distance_current_step = simulator_state["get_vehicle_distance"]
@@ -256,44 +281,64 @@ class Intersection:
         self.dic_feature = dic_feature
 
     def _orgnize_several_segments_attend(self, queue_in, queue_out):
-        part1, part2, part3 = self._get_several_segments_attend(lane_vehicles=self.dic_lane_vehicle_current_step,
-                                                                vehicle_distance=self.dic_vehicle_distance_current_step,
-                                                                vehicle_speed=self.dic_vehicle_speed_current_step,
-                                                                lane_length=self.lane_length,
-                                                                list_lanes=self.list_lanes)
-        run_in_part1 = [float(len(part1[lane])) for lane in self.list_entering_lanes]
-        run_in_part2 = [float(len(part2[lane])) for lane in self.list_entering_lanes]
-        run_in_part3 = [float(len(part3[lane])) for lane in self.list_entering_lanes]
+        part1, part2, part3 = self._get_several_segments_attend(
+            lane_vehicles=self.dic_lane_vehicle_current_step,
+            vehicle_distance=self.dic_vehicle_distance_current_step,
+            vehicle_speed=self.dic_vehicle_speed_current_step,
+            lane_length=self.lane_length,
+            list_lanes=self.list_lanes
+        )
 
-        run_out_part1 = [float(len(part1[lane])) for lane in self.list_exiting_lanes]
-        run_out_part2 = [float(len(part2[lane]))for lane in self.list_exiting_lanes]
-        run_out_part3 = [float(len(part3[lane])) for lane in self.list_exiting_lanes]
+        run_in_part1 = [float(len(part1.get(lane, []))) for lane in self.list_entering_lanes]
+        run_in_part2 = [float(len(part2.get(lane, []))) for lane in self.list_entering_lanes]
+        run_in_part3 = [float(len(part3.get(lane, []))) for lane in self.list_entering_lanes]
+
+        run_out_part1 = [float(len(part1.get(lane, []))) for lane in self.list_exiting_lanes]
+        run_out_part2 = [float(len(part2.get(lane, []))) for lane in self.list_exiting_lanes]
+        run_out_part3 = [float(len(part3.get(lane, []))) for lane in self.list_exiting_lanes]
 
         total_in, total_out = [], []
-        for i in range(12):
+        num_lanes = min(len(run_in_part1), len(queue_in), 12)
+
+        for i in range(num_lanes):
             total_in.extend([run_in_part1[i], run_in_part2[i], run_in_part3[i], queue_in[i]])
+
+        num_lanes_out = min(len(run_out_part1), len(queue_out), 12)
+        for i in range(num_lanes_out):
             total_out.extend([run_out_part1[i], run_out_part2[i], run_out_part3[i], queue_out[i]])
+
         return total_in + total_out
 
     def _get_several_segments_attend(self, lane_vehicles, vehicle_distance, vehicle_speed,
-                                           lane_length, list_lanes):
+                                    lane_length, list_lanes):
         obs_length = 100
         part1, part2, part3 = {}, {}, {}
+
         for lane in list_lanes:
             part1[lane], part2[lane], part3[lane] = [], [], []
-            for vehicle in lane_vehicles[lane]:
-                # set as num_vehicle
-                if "shadow" in vehicle:  # remove the shadow
+            vehicles = lane_vehicles.get(lane, [])
+            lane_len = lane_length.get(lane, None)
+            if lane_len is None:
+                continue  # 跳过缺失的 lane
+
+            for vehicle in vehicles:
+                if "shadow" in vehicle:
                     vehicle = vehicle[:-7]
                     continue
-                if vehicle_speed[vehicle] > 0.1:
-                    temp_v_distance = vehicle_distance[vehicle]
-                    if temp_v_distance > lane_length[lane] - obs_length:
+
+                speed = vehicle_speed.get(vehicle, None)
+                distance = vehicle_distance.get(vehicle, None)
+                if speed is None or distance is None:
+                    continue  # 跳过缺失信息的 vehicle
+
+                if speed > 0.1:
+                    if distance > lane_len - obs_length:
                         part1[lane].append(vehicle)
-                    elif lane_length[lane] - 2 * obs_length < temp_v_distance <= lane_length[lane] - obs_length:
+                    elif lane_len - 2 * obs_length < distance <= lane_len - obs_length:
                         part2[lane].append(vehicle)
-                    elif lane_length[lane] - 3 * obs_length < temp_v_distance <= lane_length[lane] - 2 * obs_length:
+                    elif lane_len - 3 * obs_length < distance <= lane_len - 2 * obs_length:
                         part3[lane].append(vehicle)
+
         return part1, part2, part3
 
     @staticmethod
@@ -353,8 +398,8 @@ class Intersection:
                                                               obs_length=self.obs_length,
                                                               list_lanes=self.list_lanes)
         """calculate traffic_movement_pressure with part queue"""
-        list_entering_part_queue = [len(l_p_q[lane]) for lane in self.list_entering_lanes]
-        list_exiting_part_queue = [len(l_p_q[lane]) for lane in self.list_exiting_lanes]
+        list_entering_part_queue = [len(l_p_q.get(lane, [])) for lane in self.list_entering_lanes]
+        list_exiting_part_queue = [len(l_p_q.get(lane, [])) for lane in self.list_exiting_lanes]
         tmp_queue_efficient_part = self._get_traffic_movement_pressure_efficient(list_entering_part_queue,
                                                                                  list_exiting_part_queue)
         tmp_queue_part = self._get_traffic_movement_pressure_general(list_entering_part_queue,
@@ -362,12 +407,12 @@ class Intersection:
 
         """calculate traffic_movement_pressure with part num vehicle"""
         # entering
-        list_entering_num_f = [len(f_p_num[lane]) for lane in self.list_entering_lanes]
-        list_entering_num_l = [len(l_p_num[lane]) for lane in self.list_entering_lanes]
+        list_entering_num_f = [len(f_p_num.get(lane, [])) for lane in self.list_entering_lanes]
+        list_entering_num_l = [len(l_p_num.get(lane, [])) for lane in self.list_entering_lanes]
         entering_num = np.array(list_entering_num_f) + np.array(list_entering_num_l)
         # exiting
-        list_exiting_num_f = [len(f_p_num[lane]) for lane in self.list_exiting_lanes]
-        list_exiting_num_l = [len(l_p_num[lane]) for lane in self.list_exiting_lanes]
+        list_exiting_num_f = [len(f_p_num.get(lane, [])) for lane in self.list_exiting_lanes]
+        list_exiting_num_l = [len(l_p_num.get(lane, [])) for lane in self.list_exiting_lanes]
         exiting_num = np.array(list_exiting_num_f) + np.array(list_exiting_num_l)
         traffic_movement_pressure_nums = self._get_traffic_movement_pressure_general(entering_num, exiting_num)
         # part of entering running vehicles, all at the end of the road
@@ -395,11 +440,14 @@ class Intersection:
         last_part_queue_vehicle = {}
 
         for lane in list_lanes:
+            if lane not in lane_length or lane not in lane_vehicles:
+                continue
             first_part_num_vehicle[lane] = []
             first_part_queue_vehicle[lane] = []
             last_part_num_vehicle[lane] = []
             last_part_queue_vehicle[lane] = []
             last_part_obs_length = lane_length[lane] - obs_length
+            
             for vehicle in lane_vehicles[lane]:
                 """ get the first part of obs
                     That is vehicle_distance <= obs_length 
@@ -426,26 +474,32 @@ class Intersection:
         return first_part_num_vehicle, last_part_num_vehicle, last_part_queue_vehicle
 
     def _get_pressure(self):
-        return [self.dic_lane_waiting_vehicle_count_current_step[lane] for lane in self.list_entering_lanes] + \
-               [-self.dic_lane_waiting_vehicle_count_current_step[lane] for lane in self.list_exiting_lanes]
+        return [
+            self.dic_lane_waiting_vehicle_count_current_step.get(lane, 0)
+            for lane in self.list_entering_lanes
+        ] + [
+            -self.dic_lane_waiting_vehicle_count_current_step.get(lane, 0)
+            for lane in self.list_exiting_lanes
+        ]
 
     def _get_lane_queue_length(self, list_lanes):
         """
         queue length for each lane
         """
-        return [self.dic_lane_waiting_vehicle_count_current_step[lane] for lane in list_lanes]
+        return [self.dic_lane_waiting_vehicle_count_current_step.get(lane, 0) for lane in list_lanes]
 
     def _get_lane_num_vehicle_entring(self):
         """
         vehicle number for each lane
         """
-        return [len(self.dic_lane_vehicle_current_step[lane]) for lane in self.list_entering_lanes]
+        return [len(self.dic_lane_vehicle_current_step.get(lane, [])) for lane in self.list_entering_lanes]
 
     def _get_lane_num_vehicle_downstream(self):
         """
         vehicle number for each lane, exiting
         """
-        return [len(self.dic_lane_vehicle_current_step[lane]) for lane in self.list_exiting_lanes]
+        return [len(self.dic_lane_vehicle_current_step.get(lane, [])) for lane in self.list_exiting_lanes]
+
 
     # ================= get functions from outside ======================
     def get_current_time(self):
@@ -543,12 +597,23 @@ class CityFlowEnv:
         _, self.lane_length = self.get_lane_length()
 
         # initialize intersections (grid)
-        self.list_intersection = [Intersection((i+1, j+1), self.dic_traffic_env_conf, self.eng,
-                                               self.traffic_light_node_dict["intersection_{0}_{1}".format(i+1, j+1)],
+        # self.list_intersection = [Intersection((i+1, j+1), self.dic_traffic_env_conf, self.eng,
+        #                                        self.traffic_light_node_dict["intersection_{0}_{1}".format(i+1, j+1)],
+        #                                        self.path_to_log,
+        #                                        self.lane_length)
+        #                           for i in range(self.dic_traffic_env_conf["NUM_COL"])
+        #                           for j in range(self.dic_traffic_env_conf["NUM_ROW"])]
+        all_intersection_neighbor_dict = self._get_all_intersection_neighbor_dict()
+
+        traffic_light_node_list = list(self.traffic_light_node_dict.keys())
+        ij_list = [(int(name.split('_')[1]), int(name.split('_')[2])) for name in traffic_light_node_list]
+        # all_intersection_map = 
+        self.list_intersection = [Intersection((i, j), self.dic_traffic_env_conf, self.eng, all_intersection_neighbor_dict, 
+                                               self.traffic_light_node_dict["intersection_{0}_{1}".format(i, j)],
                                                self.path_to_log,
                                                self.lane_length)
-                                  for i in range(self.dic_traffic_env_conf["NUM_COL"])
-                                  for j in range(self.dic_traffic_env_conf["NUM_ROW"])]
+                                for i,j in ij_list]
+
         self.list_inter_log = [[] for _ in range(self.dic_traffic_env_conf["NUM_COL"] *
                                                  self.dic_traffic_env_conf["NUM_ROW"])]
 
@@ -580,6 +645,88 @@ class CityFlowEnv:
             self.create_intersection_dict()
 
         return state
+    
+    def _get_all_intersection_neighbor_dict(self):
+        roadnet = load_json(f'./{self.dic_path["PATH_TO_DATA"]}/{self.dic_traffic_env_conf["ROADNET_FILE"]}')
+        intersections_raw = roadnet["intersections"]
+        roads_raw = roadnet["roads"]
+        neighbor_dict = self._build_neighbor_dict(intersections_raw, roads_raw)
+        return neighbor_dict
+    
+    def _build_neighbor_dict(self, intersections_raw, roads_raw):
+        """
+        根据原始的路口和道路数据，构建一个表示东南西北邻居关系的字典。
+
+        Args:
+            intersections_raw (list): 包含所有路口信息的列表。
+            roads_raw (list): 包含所有道路信息的列表。
+
+        Returns:
+            dict: 一个字典，键是路口ID，值是另一个字典，
+                该字典的键是'N', 'S', 'E', 'W'，值是对应的邻居路口ID。
+                例如: {'intersection_0_1': {'N': 'intersection_0_2', 'W': 'intersection_1_1'}}
+        """
+        
+        # 步骤 1: 创建快速查找表，方便通过ID直接获取数据
+        intersection_map = {inter["id"]: inter for inter in intersections_raw}
+        road_map = {road["id"]: road for road in roads_raw}
+        
+        neighbor_dict = {}
+
+        # 步骤 2: 遍历每一个路口，为其寻找邻居
+        for inter_id, intersection_data in intersection_map.items():
+            
+            # 为当前路口在邻居字典中创建一个空条目
+            neighbor_dict[inter_id] = {}
+            
+            # 获取当前路口的坐标
+            x1 = intersection_data["point"]["x"]
+            y1 = intersection_data["point"]["y"]
+            
+            # 步骤 3: 检查与该路口相连的每一条路
+            for road_id in intersection_data.get("roads", []):
+                road_data = road_map.get(road_id)
+                if not road_data:
+                    continue
+
+                # 步骤 4: 确定这条路的另一端是哪个邻居路口
+                start_inter = road_data["startIntersection"]
+                end_inter = road_data["endIntersection"]
+                
+                neighbor_id = None
+                if start_inter == inter_id:
+                    neighbor_id = end_inter
+                elif end_inter == inter_id:
+                    neighbor_id = start_inter
+                
+                if not neighbor_id:
+                    continue
+
+                # 步骤 5: 计算邻居路口相对于当前路口的方向
+                neighbor_data = intersection_map.get(neighbor_id)
+                if not neighbor_data:
+                    continue
+                    
+                x2 = neighbor_data["point"]["x"]
+                y2 = neighbor_data["point"]["y"]
+                
+                dx = x2 - x1
+                dy = y2 - y1
+
+                # 如果两个点坐标完全相同，则跳过
+                if dx == 0 and dy == 0:
+                    continue
+
+                # 根据dx和dy的绝对值大小，判断主要方向是东西还是南北
+                if abs(dx) > abs(dy):
+                    direction = 'E' if dx > 0 else 'W'  # East or West
+                else:
+                    direction = 'N' if dy > 0 else 'S'  # North or South
+                
+                # 步骤 6: 记录邻居关系
+                neighbor_dict[inter_id][direction] = neighbor_id
+                
+        return neighbor_dict
 
 
     def create_intersection_dict(self):
@@ -648,7 +795,8 @@ class CityFlowEnv:
                             link = road_links[l_idx]
                             location = roads[link["startRoad"]]["location"]
                             direction = link["type"]
-                            allowed_directions.append(f"{location_dict[location]}{direction_dict[direction]}")
+                            if location:
+                                allowed_directions.append(f"{location_dict[location]}{direction_dict[direction]}")
                         allowed_directions = sorted(allowed_directions)
                         allowed_directions = f"{allowed_directions[0]}{allowed_directions[1]}"
                         agent_intersections[inter_id]["phases"][allowed_directions] = {"time": p["time"], "idx": p_idx}

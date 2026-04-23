@@ -1,8 +1,9 @@
-from utils.my_utils import fix_decreasing_list, location_dict_detail, load_json, dump_json, get_state_detail, state2feature, getPrompt, action2code, code2action, eight_phase_list, four_phase_list, get_state_detail_all_lane, get_state_detail_many_seg_all_lane, location_direction_dict, location_all_direction_dict, location2releaselane, location_dict
+from utils.my_utils import location_direction_dict, location_dict
 from utils.utils import *
 import numpy as np
 from copy import deepcopy
 from collections import defaultdict
+from utils.prompts import get_advance_traffic_reasoning_prompt, get_reactive_action_prompt
 
 class IntersectionAgent(object):
     def __init__(self, agent_conf, traffic_env_conf, LLM):
@@ -10,10 +11,7 @@ class IntersectionAgent(object):
         self.agent_conf = agent_conf
         self.name = agent_conf['inter_name']
         self.id = agent_conf['inter_id']
-        self.boundary = agent_conf['boundary']
-        self.long_info = agent_conf['long_info']
-        self.feed_back = agent_conf['feed_back']
-        self.feed_back_num = agent_conf['feed_back_num']
+        # self.boundary = agent_conf['boundary']
         ## env info
         self.net_name = traffic_env_conf['name']
         self.size = traffic_env_conf['size']
@@ -25,11 +23,9 @@ class IntersectionAgent(object):
         self.llm_engine = LLM
         self.area_inter_num = self.size[0] * self.size[1]
         self.intersection_list = traffic_env_conf['intersection_list']
-        self.think_mode = agent_conf['think_mode']
-        self.h_w_size = agent_conf['h_w_size']
+        self.h_w_size = agent_conf['h_w_size'] if 'h_w_size' in agent_conf else None
+        self.syn_psr = False # default fase
         
-        
-
         ## inter_history_data
         self.log_init()
         self.area_rank = {}
@@ -51,17 +47,12 @@ class IntersectionAgent(object):
             self.careful_signals[signal]['event'] = None
         
         ## hyper param
-        self.accumulate_patience = traffic_env_conf['accumulate_patience']
-        self.congestion_scale_ratio = traffic_env_conf['congestion_scale_ratio']
-        self.boundary_distance_threshold = traffic_env_conf['boundary_distance_threshold']
 
         ## other
         self.current_state = None
         self.last_queue = 0
         # self.queue_threshold
         self.accumulate_times = 0
-        self.congestion_state = False
-        self.congestion_queue = 0
         self.connection_threshold = 0.05
         self.traffic_input_memory = {}
         self.congest_degree = []
@@ -93,10 +84,14 @@ class IntersectionAgent(object):
     
 
         
-    def update_state(self, state, last_action_id = None, update_memory = False):
+    def update_state(self, state, last_action_id = None):
         ## queue, queue_diff, state
         queue_num = 0
         wait_time = 0
+        if last_action_id!=None:
+            update_memory = True
+        else:
+            update_memory = False
         current_state = {}
         congest_degree = {}
         
@@ -152,17 +147,6 @@ class IntersectionAgent(object):
 
 
 
-        ## check if switch congestion state
-        if queue_diff > 0:
-            self.accumulate_times += 1
-            if self.accumulate_times >= self.accumulate_patience:
-                self.congestion_state = True
-                self.congestion_queue = queue_num
-        else:
-            self.accumulate_times = 0
-            if self.congestion_state == True:
-                if queue_num <= self.congestion_scale_ratio * self.congestion_queue:
-                    self.congestion_state = False
     
     def update_current_traffic_states(self, state, last_action_id):
         last_state = self.log['states'][-1] if len(self.log['states']) else None
@@ -222,6 +206,7 @@ class IntersectionAgent(object):
         self.current_traffic_states['Summary'] = summary
 
         self.traffic_state_log.append(self.current_traffic_states)  
+
     def update_memory(self, signal_id):
         signal_text = self.signal_list[signal_id]
         last_state = self.log['states'][-1] # this is the previous state, not current state
@@ -239,13 +224,6 @@ class IntersectionAgent(object):
                 continue
             lane_memory['queue_num_before'] = last_state[lane]['queue_car_num']
             lane_memory['moving_num_before'] = last_state[lane]['coming_car_num']
-            # lane_memory['downstream_occupancy_before'] = None
-            # if lane in self.up_down_stream_view:
-            #     if 'downstream' in self.up_down_stream_view[lane]:
-            #         lane_memory['downstream_occupancy_before'] = {}
-            #         for d_lane in self.up_down_stream_view[lane]['downstream']:
-            #             inter_id = self.up_down_stream_view[lane]['downstream'][d_lane]['inter_id']
-            #             lane_memory['downstream_occupancy_before'][(inter_id, d_lane)] = self.up_down_stream_view[lane]['downstream'][d_lane]['occupancy']
             lane_memory['release_results'] = {}
             lane_memory['let_downstream_over100'] = False
             for veh in self.veh_release_data[lane]: # this data update in the update_traffic_data 
@@ -255,9 +233,6 @@ class IntersectionAgent(object):
             self.memories[lane].append(lane_memory)
             
         self.recent_memory = deepcopy(recent_memory)
-
-
-
 
     def update_traffic_data(self, state):
         # signal
@@ -469,9 +444,43 @@ class IntersectionAgent(object):
     - If there are many high-occupancy lanes upstream of X and X's occupancy is not low, you MUST consider releasing X so as to help upstream lanes release.
     - You can't keep a lane waiting for too long. You MUST release the lane with excessive waiting time when the downstream condition allows.\n\n"""
         return input
+
+    def get_historical_observation_v2(self, timestep = None):
+        # get the history before timestep t-1
+        if timestep == None:
+            timestep = len(self.log['states'])-1
+        if self.syn_psr:
+            history_state = self.traffic_state_log[-self.h_w_size:]
+        else:
+            history_state = self.traffic_state_log[-self.h_w_size-1:-1]
+            
+
+        timestep_start = timestep - len(history_state)
+        text = "## Historical Observation\n"
+        text += "- Lanes include both signal-controlled lanes at the current intersection (e.g., NL, NT, SL, ST, EL, ET, WL, WT) and upstream/downstream lanes from neighboring intersections (e.g., SL's upstream lane (4, ST)). **Only lanes with vehicles are shown.**\n"
+        text += "- Values are shown as: value or value(+change from previous timestep).\n\n"
+        for i in range(len(history_state)):
+            text += f"Timestep {timestep_start + i} signal: {history_state[i]['Signal']}\n"
+            text += f"Timestep {timestep_start + i + 1} traffic states:\n"
+            text += "|Lane|Cars Input|Cars Output|Queued Cars|Moving Cars|Average Waiting Time (mins)|Occupancy (%)|\n"
+            signal_consequence = history_state[i]
+            for lane in signal_consequence:
+                if lane in ['Signal', 'Summary']:
+                    continue
+                lane_data = signal_consequence[lane]
+                exist = lane_data['Occupancy (%)'] + lane_data['Cars Input'] + lane_data['Cars Output']
+                if not exist:
+                    continue
+                text += f"|{lane}|{int(lane_data['Cars Input'])}|{int(lane_data['Cars Output'])}|{int(lane_data['Queued Cars'])}({'+' if lane_data['Queued Cars Change']>=0 else ''}{int(lane_data['Queued Cars Change'])})|{int(lane_data['Moving Cars'])}({'+' if lane_data['Moving Cars Change']>=0 else ''}{int(lane_data['Moving Cars Change'])})|{lane_data['Average Waiting Time (mins)']}({'+' if lane_data['Average Waiting Time Change (mins)']>=0 else ''}{lane_data['Average Waiting Time Change (mins)']})|{lane_data['Occupancy (%)']}({'+' if lane_data['Occupancy Change (%)']>=0 else ''}{lane_data['Occupancy Change (%)']})|\n"
+            text += '\n'
+        if self.h_w_size > 0:
+            return text
+        else:
+            return ""
     
-    def get_historical_observation(self):
-        timestep = len(self.log['states'])-1
+    def get_historical_observation(self, timestep = None):
+        if timestep == None:
+            timestep = len(self.log['states'])-1
         
         history_state = self.traffic_state_log[-self.h_w_size:]
         timestep_start = timestep - len(history_state)
@@ -511,131 +520,86 @@ class IntersectionAgent(object):
         # text += long_distance_info_text
         # text += '\n' 
         return text
-
-    def multi_level_decision_making_prompt(self, effective_range_list):
-        timestep = len(self.log['states'])-1
-        input_text = self.get_back_ground_and_note_text()
-        input_text += "## Data\n"
-        historical_observation = self.get_historical_observation()
-        input_text += historical_observation
-        input_text += "### Current Observation\n"
-        input_text += f"Timestep: {timestep}\n"
-        current_observation_text = self.get_current_observation_text()
-        signal_rank_text = self.get_signal_rank_text(effective_range_list)
-        input_text += current_observation_text
-        input_text += '\n'
-        input_text += signal_rank_text
-        if self.think_mode == 'quick':
-            input_text += """## Task:\nYou MUST select the highest-ranked priority signal\n\n## Requirement:\nPlease provide a JSON formatted output as follows: \n```json  \n{  \n   "answer": "ETWT" | "NTST" | "ELWL" | "NLSL"  \n}\n``` """
-        elif self.think_mode == 'mild':
-            input_text += """## Task:\n- Focus on the "Current Observation" data.\n- Keep the "Notes" in mind, compare each signal, and select the optimal one based on traffic conditions.\n\n## Requirement:\nPlease provide a JSON formatted output as follows: \n```json  \n{  \n   "thought_process": "Your thought process text description",  \n   "answer": "ETWT" | "NTST" | "ELWL" | "NLSL"  \n}\n```  """
-        elif self.think_mode == 'slow':
-            input_text += """## Task:\nYou MUST conduct a comprehensive analysis and select the optimal signal by following these steps:\n1. **Current Traffic Data Analysis**: Rank lanes based on queued cars and waiting times.\n2. **Upstream Analysis**: Assess the conditions of nearby and long-distance upstream lanes for each lane.\n3. **Downstream Analysis**: Assess the conditions of nearby and long-distance downstream lanes for each lane.\n4. **Signal Consequence Prediction**: Utilize "Historical Observation" data for inferring the consequences of each signal. \n5. **Signal Comparison**: Systematically compare the effects of each signal option.\n6. **Decision Making**: Make a decision on the optimal signal to activate.\n\n## Requirement:\nPlease provide a JSON formatted output as follows: \n```json  \n{  \n    "thought_process": "1. **Current Traffic Data Analysis**: xxxxx",  \n    "answer": "ETWT" | "NTST" | "ELWL" | "NLSL"  \n}\n``` """
-        elif self.think_mode == 'qm':
-            input_text += """## Task:\nYour task consists of two phases:\n### Phase 1: Coordination Scenario Classification\n1. Analyze the data in "Current Observation" and classify the intersection into one of two coordination scenarios:\n   - **No-Coordination**: No upstream or downstream coordination needs.\n   - **Simple-Coordination**: Few upstream or downstream lanes require coordination with low traffic complexity.\n\n### Phase 2: Signal Selection Strategy\nBased on the identified coordination scenario, select the appropriate signal using the following strategies:\n\n#### a. No-Coordination\n- Directly select the highest-ranked priority signal, as there are no external coordination considerations.\n\n#### b. Simple-Coordination\n- Focus on the "Current Observation" data.\n- Keep the "Notes" in mind, compare each signal, and select the optimal one based on traffic conditions.\n\n## Requirement:\nPlease provide a JSON formatted output as follows: \n```json  \n{  \n  "phase1": {  \n    "thought_process": "Your thought process text description",  \n    "answer": "NO" | "Simple"  \n  },  \n  "phase2": {  \n    "thought_process": "Your thought process text description",  \n    "answer": "ETWT" | "NTST" | "ELWL" | "NLSL"  \n  }  \n}\n``` """
-        elif self.think_mode == 'qs':
-            input_text += """## Task:\nYour task consists of two phases:\n### Phase 1: Coordination Scenario Classification\n1. Analyze the data in "Current Observation" and classify the intersection into one of two coordination scenarios:\n   - **No-Coordination**: No upstream or downstream coordination needs.\n   - **Complex-Coordination**: High traffic complexity with significant congestion in upstream or downstream lanes.\n\n### Phase 2: Signal Selection Strategy\nBased on the identified coordination scenario, select the appropriate signal using the following strategies:\n\n#### a. No-Coordination\n- Directly select the highest-ranked priority signal, as there are no external coordination considerations.\n\n#### b. Complex-Coordination\nConduct a comprehensive analysis and select the optimal signal by following these steps:\n1. **Current Traffic Data Analysis**: Rank lanes based on queued cars and waiting times.\n2. **Upstream Analysis**: Assess the conditions of nearby and long-distance upstream lanes for each lane.\n3. **Downstream Analysis**: Assess the conditions of nearby and long-distance downstream lanes for each lane.\n4. **Signal Consequence Prediction**: Utilize "Historical Observation" data for inferring the consequences of each signal. \n5. **Signal Comparison**: Systematically compare the effects of each signal option.\n6. **Decision Making**: Make a decision on the optimal signal to activate.\n\n## Requirement:\nPlease provide a JSON formatted output as follows: \n```json  \n{  \n  "phase1": {  \n    "thought_process": "Your thought process text description",  \n    "answer": "NO" | "Complex"  \n  },  \n  "phase2": {  \n    "thought_process": "Your thought process text description",  \n    "answer": "ETWT" | "NTST" | "ELWL" | "NLSL"  \n  }  \n}\n``` """
-        elif self.think_mode == 'ms':
-            input_text += """## Task:\nYour task consists of two phases:\n### Phase 1: Coordination Scenario Classification\n1. Analyze the data in \"Current Observation\" and classify the intersection into one of two coordination scenarios:\n   - **Simple-Coordination**: Few upstream or downstream lanes require coordination with low traffic complexity.\n   - **Complex-Coordination**: High traffic complexity with significant congestion in upstream or downstream lanes.\n\n### Phase 2: Signal Selection Strategy\nBased on the identified coordination scenario, select the appropriate signal using the following strategies:\n\n#### a. Simple-Coordination\n- Focus on the \"Current Observation\" data.\n- Keep the \"Notes\" in mind, compare each signal, and select the optimal one based on traffic conditions.\n\n#### b. Complex-Coordination\nConduct a comprehensive analysis and select the optimal signal by following these steps:\n1. **Current Traffic Data Analysis**: Rank lanes based on queued cars and waiting times.\n2. **Upstream Analysis**: Assess the conditions of nearby and long-distance upstream lanes for each lane.\n3. **Downstream Analysis**: Assess the conditions of nearby and long-distance downstream lanes for each lane.\n4. **Signal Consequence Prediction**: Utilize \"Historical Observation\" data for inferring the consequences of each signal. \n5. **Signal Comparison**: Systematically compare the effects of each signal option.\n6. **Decision Making**: Make a decision on the optimal signal to activate.\n\n## Requirement:\nPlease provide a JSON formatted output as follows: \n```json  \n{  \n  \"phase1\": {  \n    \"thought_process\": \"Your thought process text description\",  \n    \"answer\": \"NO\" | \"Simple\" | \"Complex\"  \n  },  \n  \"phase2\": {  \n    \"thought_process\": \"Your thought process text description\",  \n    \"answer\": \"ETWT\" | \"NTST\" | \"ELWL\" | \"NLSL\"  \n  }  \n}\n```"""
-        
-        else:
-            input_text += "## Task:\n"
-            input_text += """Your task consists of two phases:
-        ### Phase 1: Coordination Scenario Classification
-        1. Analyze the data in "Current Observation" and classify the intersection into one of three coordination scenarios:
-        - **No-Coordination**: No upstream or downstream coordination needs.
-        - **Simple-Coordination**: Few upstream or downstream lanes require coordination with low traffic complexity.
-        - **Complex-Coordination**: High traffic complexity with significant congestion in upstream or downstream lanes.
-
-        ### Phase 2: Signal Selection Strategy
-        Based on the identified coordination scenario, select the appropriate signal using the following strategies:
-
-        #### a. No-Coordination
-        - Directly select the highest-ranked priority signal, as there are no external coordination considerations.
-
-        #### b. Simple-Coordination
-        - Focus on the "Current Observation" data.
-        - Keep the "Notes" in mind, compare each signal, and select the optimal one based on traffic conditions.
-
-        #### c. Complex-Coordination
-        Conduct a comprehensive analysis and select the optimal signal by following these steps:
-        1. **Current Traffic Data Analysis**: Rank lanes based on queued cars and waiting times.
-        2. **Upstream Analysis**: Assess the conditions of nearby and long-distance upstream lanes for each lane.
-        3. **Downstream Analysis**: Assess the conditions of nearby and long-distance downstream lanes for each lane.
-        4. **Signal Consequence Prediction**: Utilize "Historical Observation" data for inferring the consequences of each signal. 
-        5. **Signal Comparison**: Systematically compare the effects of each signal option.
-        6. **Decision Making**: Make a decision on the optimal signal to activate.\n\n"""
-
-            input_text += "## Requirement:\n"
-            input_text += """Please provide a JSON formatted output as follows: 
-        ```json  
-        {  
-        "phase1": {  
-            "thought_process": "Your thought process text description",  
-            "answer": "NO" | "Simple" | "Complex"  
-        },  
-        "phase2": {  
-            "thought_process": "Your thought process text description",  
-            "answer": "ETWT" | "NTST" | "ELWL" | "NLSL"  
-        }  
-        }
-        ``` """
-
-        return input_text
     
-    def select_signal_based_on_up_down_stream_view_prompt(self):
-        prompt = "**Current Observations:**\n"
-        # prompt += "If a lane among 12 lanes is not mentioned, it means there are no vehicles on it at present. \n"
-        observation_of_this_inter_text = self.get_current_lane_observation_text_tablestyle()
-        
-        up_down_stream_view_text = self.get_up_down_stream_view_text()
-        prompt += "\n"
-        prompt += observation_of_this_inter_text
-        prompt += '{} are empty.\n'.format(self.empty_lanes)
-        prompt += "\n"
-        prompt += up_down_stream_view_text
-        prompt += "\n"
-        # prompt += "If the upstream or downstream of a lane is not mentioned, it means its occupancy is low.\n"
-        if self.long_info:
-            long_distance_info_text = self.get_long_distance_info_text()
-            prompt += long_distance_info_text
-            prompt += "\n"
-        if self.feed_back:
-            memories_text = self.get_memory_text()
-            prompt += memories_text
-            prompt += "\n"
+    def get_current_observation_text_v2(self, step_num):
+        signal = self.traffic_state_log[-1]['Signal']
+        text = "## Current Observation\n"
+        text += f"Timestep {step_num} signal: {signal}\n"
+        return text
+    
+    def get_current_observation_text_v3(self, step_num):
+        signal = self.traffic_state_log[-1]['Signal']
+        text = "# Current Observation\n"
+        text += "- Lanes include both signal-controlled lanes at the current intersection (e.g., NL, NT, SL, ST, EL, ET, WL, WT) and upstream/downstream lanes from neighboring intersections (e.g., SL's upstream lane (4, ST)). **Only lanes with vehicles are shown.**\n"
+        text += "- Values are shown as: value or value(+change from previous timestep).\n\n"
+        text += f"Timestep {step_num-1} signal: {signal}\n"
+        current_state = self.traffic_state_log[-1]
+        text += f"Timestep {step_num} traffic states:\n"
+        text += "|Lane|Cars Input|Cars Output|Queued Cars|Moving Cars|Average Waiting Time (mins)|Occupancy (%)|\n"
+        for lane in current_state:
+            if lane in ['Signal', 'Summary']:
+                continue
+            lane_data = current_state[lane]
+            exist = lane_data['Occupancy (%)'] + lane_data['Cars Input'] + lane_data['Cars Output']
+            if not exist:
+                continue
+            text += f"|{lane}|{int(lane_data['Cars Input'])}|{int(lane_data['Cars Output'])}|{int(lane_data['Queued Cars'])}({'+' if lane_data['Queued Cars Change']>=0 else ''}{int(lane_data['Queued Cars Change'])})|{int(lane_data['Moving Cars'])}({'+' if lane_data['Moving Cars Change']>=0 else ''}{int(lane_data['Moving Cars Change'])})|{lane_data['Average Waiting Time (mins)']}({'+' if lane_data['Average Waiting Time Change (mins)']>=0 else ''}{lane_data['Average Waiting Time Change (mins)']})|{lane_data['Occupancy (%)']}({'+' if lane_data['Occupancy Change (%)']>=0 else ''}{lane_data['Occupancy Change (%)']})|\n"
+        text += '\n'
+        return text
 
-        prompt += "**Task:**\n"
-        prompt += "You must select a signal from the options [ETWT, NTST, ELWL, NLSL] to activate in the next period. For example, ETWT indicates the release of both the ET and WT lanes.\n\n"
-        
-        prompt += "**NOTE:**\n"
-        # prompt += "- If there are many cars upstream of a certain lane, you need to estimate whether there is enough space in this lane currently and consider whether to release this lane.\n"
-        # prompt += "- If you want to release a lane, you need to consider whether its downstream has enough space.\n"
+    def estimate_effective_range(self):
+        state = self.state
+        car_speed = 11.11
+        if len(self.intersection_list) == 33:
+            car_speed = 16.67
+        seg_num = 10
+        effective_range_distance = car_speed * self.signal_time
+        range_list = []
+        for lane in location_direction_dict:
+            road_length = state[lane]['road_length']
+            seg_length = road_length/seg_num
+            effective_range_cell = int(effective_range_distance//seg_length)
+            if effective_range_cell >= seg_num:
+                effective_range_cell = seg_num - 1
+            range_list.append(effective_range_cell)
+        return range_list
+    
+    def get_local_signal_priority_text(self):
+        text = "# Local Signal Priority\n"
+        text += "This rank only considers your own intersection and assumes the downstream allows the release.\n"
+        lane_release_metrix = {}
+        effective_range_list = self.estimate_effective_range()
+        for i, lane in enumerate(location_direction_dict):
+            lane_range = effective_range_list[i]
+            going_cars_num = np.sum(self.state[lane]["cells"][:lane_range+1])
+            stop_cars_num = np.sum(self.state[lane]["ql_cells"][:lane_range+1])
+            lane_release_metrix[lane] = stop_cars_num * self.state[lane]["avg_wait_time"] + stop_cars_num * self.signal_time + going_cars_num * self.signal_time 
+        signal_value_dict = {}
+        for p in self.signal_list:
+            signal_value_dict[p] = lane_release_metrix[p[:2]] + lane_release_metrix[p[2:]]
 
-        # prompt += "- Occupancy above 100% will result in severe congestion. Make sure that the occupancy of your lane and your upstream and downstream lanes never exceeds 100%.\n"
-        # prompt += "- If your lane is over 100%, only release it when your downstream has enough space.\n"
-        prompt += "For each Lane X, when considering activating it, keep these in mind: \n"
-        prompt += "- NEVER let the occupancy of X's downstream lanes be close to 100% at any risk, as it will cause severe congestion.\n"
-        prompt += "- If the upstream or downstream information of X isn't mentioned, it means that they are in a good state with low occupancy.\n"
-        prompt += "- You MUST consider how much the occupancy of X's downstream lanes will increase upon releasing lane X. \n"
-        prompt += "- You MUST delay the release of X if its downstream has a high occupancy rate.\n"
-        prompt += "- If there are many high-occupancy lanes upstream of X and X's occupancy is not low, you MUST consider releasing X so as to help upstream lanes release.\n"
-        prompt += "- You can't keep a lane waiting for too long. You MUST release the lane with excessive waiting time when the downstream condition allows.\n\n"
-        # prompt += "- If nearby downstream lanes of a lane are highly occupied, releasing it will worsen the situation.\n"
-        
-
-        prompt += "**Requirement:**\n"
-        prompt += "- Let's think step by step. \n"
-
-        prompt += "- You must follow the following steps: Step 1: Current Traffic Data Analysis - Identify the (queue cars, waiting time) ranking of lanes. Step 2: Upstream Analysis - For each lane, analyze its nearby and long-distance upstream situations. Step 3: Downstream Analysis - For each lane, analyze its downstream situation and estimate how much the occupancy of downstream lanes will increase if this lane is activated based on the information in memories. Step 4: Compare each signal. Step 5: Make a decision.\n"
-        # prompt += "- Consider these questions carefully before choosing a signal: 1. Is there a lane where vehicles wait too long or have a significant queue? 2. Does your current situation meet the needs of other intersections? 3. How will selecting a certain signal impact the average waiting time and queue length at all intersections?"
-        # prompt += "- You must follow the following steps: Step 1: Provide your thoughts. Step 2: Give the signal answer.\n"
-
-        prompt += "- Your answer can only be given after finishing the thought.\n"
-        # prompt += "- Explain briefly before answering.\n"
-        prompt += "- Answer format: You MUST provide a final signal within tags <signal>...</signal>.\n"
-        prompt += "- Answer options: [<signal>ETWT</signal>, <signal>NTST</signal>, <signal>ELWL</signal>, <signal>NLSL</signal>]\n"
+        text += "|Rank|Signal|Waiting Time Reduction|\n"
+        for i, p in enumerate(sorted(signal_value_dict, key=signal_value_dict.get, reverse=True)):
+            text += "|{}|{}|{:.1f} mins|\n".format(i+1, p, signal_value_dict[p]/60)
+        text += '\n'
+        return text
+    
+    def advance_traffic_reasoning_prompt(self, step_num):
+        # step_num is timestep t, advance traffic reasoning in t-1
+        if self.syn_psr:
+            step_num = step_num+1
+        historical_observation_text = self.get_historical_observation_v2(step_num-1)
+        current_observation_text = self.get_current_observation_text_v2(step_num-1)
+        prompt = get_advance_traffic_reasoning_prompt(t0=step_num-1, t1=step_num, historical_observation=historical_observation_text, current_observation=current_observation_text)
         return prompt
+    
+    def reactive_action_prompt(self, advance_traffic_reasoning_results, step_num):
+        current_observation_text = self.get_current_observation_text_v3(step_num)
+        local_signal_priority = self.get_local_signal_priority_text()
+        prompt = get_reactive_action_prompt(t0=step_num-1, t1=step_num, advance_traffic_reasoning_results=advance_traffic_reasoning_results, current_observation=current_observation_text, local_signal_priority=local_signal_priority)
+        return prompt
+
+
 
     def get_current_lane_observation_text_tablestyle(self):
         text = "#### **Intersection Lanes - Controlled by You:** \n"

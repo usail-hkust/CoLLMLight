@@ -30,7 +30,7 @@ def parse_args():
     parser.add_argument("--feed_back_num", type=int, default=1)
     parser.add_argument("--debug_wollm", type=bool, default=False)
     parser.add_argument("--reward_period", type=int, default=5)
-    parser.add_argument("--ignore_threshold", type=float, default=0.5)
+    parser.add_argument("--ignore_threshold", type=float, default=0)
     return parser.parse_args()
 
 

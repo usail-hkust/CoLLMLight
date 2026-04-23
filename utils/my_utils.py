@@ -3,6 +3,7 @@ import json
 import copy
 import torch
 from copy import deepcopy
+import re
 
 location_dict_short = {"North": "N", "South": "S", "East": "E", "West": "W"}
 location_direction_dict = ["NT", "NL", "ST", "SL", "ET", "EL", "WT", "WL"]
@@ -1008,3 +1009,92 @@ def torch_gc():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
+
+
+def extract_json_reactive_action_results(response):
+    """
+    从LLM的响应中提取JSON格式的信号选择结果。
+    此版本经过优化，可以处理可选的markdown代码块，并且对JSON键名大小写不敏感。
+    
+    返回:
+        一个包含 'signal', 'reason', 和 'used_atr' 字段的字典。
+    """
+    try:
+        json_data = None
+        # 1. 优先尝试从 ```json ... ``` 代码块中提取JSON
+        match = re.search(r"```json\s*({.*?})\s*```", response, re.DOTALL)
+        if match:
+            json_data = match.group(1)
+        else:
+            # 2. 如果没有找到代码块，则在整个字符串中查找第一个有效的JSON对象
+            match = re.search(r"({.*})", response.strip(), re.DOTALL)
+            if match:
+                json_data = match.group(1)
+
+        if json_data:
+            # 解析提取到的JSON字符串
+            data = json.loads(json_data)
+            
+            # *** 新增：将所有键转换为小写，以实现大小写不敏感 ***
+            data_lower = {k.lower(): v for k, v in data.items()}
+            
+            # 使用处理过的字典安全地获取值
+            result = {
+                'signal': data_lower.get('signal'),
+                'reason': data_lower.get('reason'),
+                'used_atr': data_lower.get('used_atr', 0)
+            }
+            return result
+        
+        else:
+            # 如果在响应中找不到任何JSON数据
+            return {'signal': None, 'reason': None, 'used_atr': 0}
+            
+    except json.JSONDecodeError:
+        # 如果JSON格式错误
+        return {'signal': None, 'reason': None, 'used_atr': 0}
+    except Exception:
+        # 捕获其他未知异常
+        return {'signal': None, 'reason': None, 'used_atr': 0}
+
+def count_double_hash_pattern(text: str) -> int:
+    """
+    统计字符串中"## xxx"模式的出现次数
+    
+    参数:
+    text (str): 需要检查的文本
+    
+    返回:
+    int: 匹配的模式数量
+    """
+    pattern = r'## [^\n]+'
+    return len(re.findall(pattern, text))
+
+def calculate_reactive_action_reward(reactive_action_response: str, best_signal: str) -> tuple[float, int]:
+    try:
+        ra_results_json = extract_json_reactive_action_results(reactive_action_response)
+        signal = ra_results_json['signal']
+        used_atr = ra_results_json['used_atr']
+        
+        if signal == best_signal:
+            reward = 1.0
+        else:
+            reward = -1.0
+    except Exception:
+        reward = -1.0
+        used_atr = 0
+    
+    return reward, int(used_atr)
+
+def calculate_advance_reasoning_reward(
+    advance_reasoning_response: str,
+    reactive_action_reward: float,
+    used_atr: int
+) -> float:
+    L_max = 8.0
+    L = min(count_double_hash_pattern(advance_reasoning_response), L_max)
+    beta = 0.5
+    length_reward = beta * (1 - L / L_max)
+    effectiveness_reward = (1 - beta) * float(used_atr)
+    reward = reactive_action_reward * (length_reward + effectiveness_reward)
+    return reward
