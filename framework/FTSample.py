@@ -313,7 +313,7 @@ class FTS:
             ## select_signal
             action_list = []
             for inter_id, inter_agent in enumerate(self.agent_intersection_list):
-                effective_range_list = self.estimate_effective_range(current_states[i])
+                effective_range_list = self.estimate_effective_range(current_states[inter_id])
                 signal_text = inter_agent.select_signal_default(effective_range_list)
                 action_list.append(action2code(signal_text))
             
